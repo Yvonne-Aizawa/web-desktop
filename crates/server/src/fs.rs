@@ -44,8 +44,9 @@ use axum::{
 use serde::Deserialize;
 use shared::fs::{
     API_FS_CONTENT, API_FS_DELETE, API_FS_DIR, API_FS_DOWNLOAD, API_FS_ENTRY, API_FS_LIST,
-    API_FS_PREVIEW, API_FS_RAW, ApiError, DirListing, EntryKind, FilePreview, FsEntry, FsInfo,
-    FsMutation, PreviewBody, image_mime,
+    API_FS_PREVIEW, API_FS_RAW, API_FS_TRASH, API_FS_TRASH_RESTORE, ApiError, DirListing,
+    EntryKind, FilePreview, FsEntry, FsInfo, FsMutation, PreviewBody, TRASH_DIR, TrashEntry,
+    TrashListing, TrashRestore, contains_protected, image_mime, protected_by,
 };
 use tokio_util::io::ReaderStream;
 
@@ -76,6 +77,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route(API_FS_DIR, post(create_dir))
         .route(API_FS_ENTRY, patch(rename_entry))
         .route(API_FS_DELETE, axum::routing::delete(delete_entry))
+        // The trash is a place, not a flag: it is listed, restored from and emptied
+        // through its own endpoints, and the file endpoints will not touch it.
+        .route(API_FS_TRASH, get(list_trash).delete(purge_trash))
+        .route(API_FS_TRASH_RESTORE, post(restore_trash))
         .layer(DefaultBodyLimit::max(MAX_FILE_BYTES as usize))
         .route_layer(middleware::from_fn(same_origin))
 }
@@ -109,6 +114,10 @@ pub struct FsRoot {
     writable: bool,
     /// Why not, when they are not.
     readonly_reason: Option<String>,
+    /// Root-relative paths that stay read-only even when the rest of the root is
+    /// writable, from `WEB_DESKTOP_FS_READONLY`. The operator uses this to put
+    /// something inside the sandbox that the app can read but never lose.
+    protected: Vec<String>,
 }
 
 impl FsRoot {
@@ -118,6 +127,7 @@ impl FsRoot {
         path: &Path,
         writable: bool,
         readonly_reason: Option<String>,
+        protected: Vec<String>,
     ) -> std::io::Result<(Self, bool)> {
         let created = !path.exists();
         std::fs::create_dir_all(path)?;
@@ -127,6 +137,7 @@ impl FsRoot {
                 root,
                 writable,
                 readonly_reason,
+                protected,
             },
             created,
         ))
@@ -138,6 +149,7 @@ impl FsRoot {
             root: self.root.to_string_lossy().into_owned(),
             writable: self.writable,
             readonly_reason: self.readonly_reason.clone(),
+            readonly_paths: self.protected.clone(),
             max_preview_bytes: MAX_PREVIEW_BYTES,
             max_write_bytes: MAX_FILE_BYTES,
         }
@@ -153,6 +165,58 @@ impl FsRoot {
                 .clone()
                 .unwrap_or_else(|| "this file browser is read-only".to_owned()),
         ))
+    }
+
+    /// Refuse a mutation of a path the operator protected.
+    ///
+    /// Takes a *canonical* root-relative path, so a symlink pointing into a protected
+    /// folder is caught the same way the real path would be.
+    fn editable(&self, rel: &str) -> Result<(), FsError> {
+        if let Some(rule) = protected_by(rel, &self.protected) {
+            let where_ = if rel.trim_matches('/') == rule {
+                "it is".to_owned()
+            } else {
+                format!("it is inside `{rule}`, which is")
+            };
+            return Err(FsError::Denied(format!(
+                "`{rel}` is read-only: {where_} listed in WEB_DESKTOP_FS_READONLY"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Refuse a mutation that would take protected paths with it.
+    ///
+    /// Deleting or renaming a folder modifies everything inside it, so a rule about one
+    /// entry is a rule about every folder above it.
+    fn editable_tree(&self, rel: &str) -> Result<(), FsError> {
+        self.editable(rel)?;
+        if let Some(rule) = contains_protected(rel, &self.protected) {
+            return Err(FsError::Denied(format!(
+                "`{rel}` holds `{rule}`, which is read-only because it is listed in \
+                 WEB_DESKTOP_FS_READONLY"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether a root-relative path is inside the trash, which the file API does not
+    /// expose at all: it is reached through the trash endpoints.
+    fn is_trash(&self, rel: &str) -> bool {
+        let rel = rel.trim_matches('/');
+        rel == shared::fs::TRASH_DIR || rel.starts_with(&format!("{}/", shared::fs::TRASH_DIR))
+    }
+
+    /// The same check for a path that has already been resolved, so the caller does not
+    /// have to keep the original string around.
+    fn refuse_trash(&self, path: &Path) -> Result<(), FsError> {
+        let rel = self.relative(path);
+        if self.is_trash(&rel) {
+            return Err(FsError::Denied(format!(
+                "`{rel}` is in the trash; use the trash endpoints"
+            )));
+        }
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
@@ -279,12 +343,23 @@ pub struct DownloadQuery {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct TrashQuery {
+    /// A trash entry id, or empty to mean the whole trash.
+    #[serde(default)]
+    pub id: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct DeleteQuery {
     #[serde(default)]
     pub path: String,
-    /// Required to remove a directory that still has something in it.
+    /// Required to remove a directory that still has something in it, for a
+    /// permanent delete. Trashing one needs no flag: a move is a move.
     #[serde(default)]
     pub recursive: bool,
+    /// Delete for good instead of moving to the trash.
+    #[serde(default)]
+    pub permanent: bool,
 }
 
 async fn list(
@@ -293,6 +368,7 @@ async fn list(
 ) -> Result<Json<DirListing>, FsError> {
     let root = state.fs.as_ref().ok_or_else(FsError::fs_disabled)?;
     let dir = root.resolve(&q.path)?;
+    root.refuse_trash(&dir)?;
 
     let meta = tokio::fs::metadata(&dir)
         .await
@@ -357,6 +433,11 @@ async fn list(
 /// stay inside the root. `None` means the metadata could not be read at all.
 async fn describe(root: &FsRoot, entry: &tokio::fs::DirEntry) -> Option<FsEntry> {
     let name = entry.file_name().to_string_lossy().into_owned();
+    // Never listed, not even as a hidden file: it is the browser's own bookkeeping,
+    // and a delete is supposed to make something disappear.
+    if name == TRASH_DIR {
+        return None;
+    }
     let link_meta = tokio::fs::symlink_metadata(entry.path()).await.ok()?;
     let is_symlink = link_meta.file_type().is_symlink();
 
@@ -391,6 +472,7 @@ async fn describe(root: &FsRoot, entry: &tokio::fs::DirEntry) -> Option<FsEntry>
     };
 
     let path = root.relative(entry.path().as_path());
+    let protected = protected_by(&path, &root.protected).is_some();
 
     Some(FsEntry {
         hidden: name.starts_with('.'),
@@ -399,7 +481,9 @@ async fn describe(root: &FsRoot, entry: &tokio::fs::DirEntry) -> Option<FsEntry>
         kind,
         size,
         modified: modified_millis(link_meta.modified().ok()),
-        readonly: link_meta.permissions().readonly(),
+        // Both reasons the server would refuse a write, so the UI can lock the row
+        // rather than offer an action that will fail.
+        readonly: protected || link_meta.permissions().readonly(),
         blocked,
     })
 }
@@ -410,6 +494,7 @@ async fn preview(
 ) -> Result<Json<FilePreview>, FsError> {
     let root = state.fs.as_ref().ok_or_else(FsError::fs_disabled)?;
     let path = root.resolve(&q.path)?;
+    root.refuse_trash(&path)?;
 
     let meta = tokio::fs::metadata(&path)
         .await
@@ -572,6 +657,8 @@ async fn write_content(
     }
 
     let path = root.resolve_parent(&q.path)?;
+    root.refuse_trash(&path)?;
+    root.editable(&root.relative(&path))?;
 
     // Replacing a directory, or a link that points outside the root, is not a write.
     match tokio::fs::symlink_metadata(&path).await {
@@ -603,7 +690,9 @@ async fn create_dir(
 
     let name = entry_name(&request.name)?;
     let parent = root.resolve(&request.path)?;
+    root.refuse_trash(&parent)?;
     let target = parent.join(name);
+    root.editable(&root.relative(&target))?;
 
     // Creation must not be a way to follow a link out of the root, and must not
     // silently adopt an existing entry.
@@ -638,11 +727,16 @@ async fn rename_entry(
     if source == root.root() {
         return Err(FsError::Denied("cannot rename the root".to_owned()));
     }
+    root.refuse_trash(&source)?;
+    // A rename moves everything inside, so a protected path anywhere in the tree has
+    // to stop it.
+    root.editable_tree(&root.relative(&source))?;
     let target = root.resolve_parent(&match request.path.rsplit_once('/') {
         Some((parent, _)) => format!("{parent}/{name}"),
         None => name.to_owned(),
     })?;
 
+    root.editable(&root.relative(&target))?;
     if target == source {
         let meta = tokio::fs::symlink_metadata(&source)
             .await
@@ -664,10 +758,15 @@ async fn rename_entry(
 }
 
 /// Delete a file, or a directory when `recursive=true`.
+///
+/// Unless `permanent=true`, this is a *move* into the trash, and the answer is the
+/// [`TrashEntry`] that can put it back — which is what makes "delete" undoable and what
+/// makes the confirmation dialog honest. Nothing here needs `recursive`: moving a
+/// folder is one rename, however full it is.
 async fn delete_entry(
     State(state): State<Arc<AppState>>,
     Query(q): Query<DeleteQuery>,
-) -> Result<StatusCode, FsError> {
+) -> Result<Response, FsError> {
     let root = state.fs.as_ref().ok_or_else(FsError::fs_disabled)?;
     root.writable()?;
 
@@ -678,10 +777,17 @@ async fn delete_entry(
     if target == root.root() {
         return Err(FsError::Denied("cannot delete the root".to_owned()));
     }
+    root.refuse_trash(&target)?;
+    root.editable_tree(&root.relative(&target))?;
 
     let meta = tokio::fs::symlink_metadata(&target)
         .await
         .map_err(|e| FsError::from_io(&e, &q.path))?;
+
+    if !q.permanent {
+        let entry = trash_now(root, &target, &q.path, &meta).await?;
+        return Ok(Json(entry).into_response());
+    }
 
     if meta.is_dir() {
         if !q.recursive {
@@ -706,8 +812,253 @@ async fn delete_entry(
             .map_err(|e| FsError::from_io(&e, &q.path))?;
     }
 
-    tracing::info!("fs: deleted {}", q.path);
+    tracing::info!("fs: deleted {} for good", q.path);
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+// -------------------------------------------------------------------- trash
+//
+// A delete is a rename into `<root>/.trash/<id>/payload`, next to an `info.json` that
+// remembers where it came from. Same filesystem, so the rename is atomic and costs
+// nothing however large the file is; the trash is a place inside the fence, not a
+// second copy of it.
+
+/// Identifiers are a timestamp plus a per-process counter: unique without a random
+/// number generator, and they sort in the order things were deleted.
+fn trash_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{nanos}-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Move one entry into the trash and describe what was moved.
+async fn trash_now(
+    root: &FsRoot,
+    target: &Path,
+    rel: &str,
+    meta: &std::fs::Metadata,
+) -> Result<TrashEntry, FsError> {
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let id = trash_id();
+    let holding = root.root().join(TRASH_DIR).join(&id);
+
+    let entry = TrashEntry {
+        id: id.clone(),
+        name,
+        path: root.relative(target),
+        kind: if meta.is_dir() {
+            EntryKind::Dir
+        } else if meta.is_file() {
+            EntryKind::File
+        } else {
+            EntryKind::Other
+        },
+        size: if meta.is_dir() { 0 } else { meta.len() },
+        deleted_at: modified_millis(Some(std::time::SystemTime::now())).unwrap_or(0),
+    };
+
+    tokio::fs::create_dir_all(&holding)
+        .await
+        .map_err(|e| FsError::from_io(&e, rel))?;
+    // The note goes down first. If the rename fails we clear up, and if the process
+    // dies in between there is a folder with no payload, which the listing skips.
+    let note = serde_json::to_vec_pretty(&entry)
+        .map_err(|e| FsError::BadRequest(format!("could not describe the entry: {e}")))?;
+    if let Err(err) = tokio::fs::write(holding.join("info.json"), note).await {
+        let _ = tokio::fs::remove_dir_all(&holding).await;
+        return Err(FsError::from_io(&err, rel));
+    }
+    if let Err(err) = tokio::fs::rename(target, holding.join("payload")).await {
+        let _ = tokio::fs::remove_dir_all(&holding).await;
+        return Err(FsError::from_io(&err, rel));
+    }
+
+    tracing::info!("fs: trashed {rel} as {id}");
+    Ok(entry)
+}
+
+/// Read one trash entry, or explain why it cannot be used.
+async fn read_trash_entry(root: &FsRoot, id: &str) -> Result<(PathBuf, TrashEntry), FsError> {
+    // The id arrives from the client, so it is a single component or nothing: the
+    // resolve below is the second half of that promise.
+    let id = entry_name(id)?;
+    let holding = root.resolve(&format!("{TRASH_DIR}/{id}"))?;
+    let bytes = tokio::fs::read(holding.join("info.json"))
+        .await
+        .map_err(|e| FsError::from_io(&e, "that trash entry"))?;
+    let entry: TrashEntry = serde_json::from_slice(&bytes)
+        .map_err(|_| FsError::BadRequest("that trash entry cannot be read".to_owned()))?;
+    Ok((holding, entry))
+}
+
+async fn list_trash(State(state): State<Arc<AppState>>) -> Result<Json<TrashListing>, FsError> {
+    let root = state.fs.as_ref().ok_or_else(FsError::fs_disabled)?;
+    Ok(Json(gather_trash(root).await?))
+}
+
+/// Newest first.
+async fn gather_trash(root: &FsRoot) -> Result<TrashListing, FsError> {
+    let mut entries = Vec::new();
+    let mut total_bytes = 0;
+    let mut read = match tokio::fs::read_dir(root.root().join(TRASH_DIR)).await {
+        Ok(read) => read,
+        // No trash yet is an empty trash, not a failure.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(TrashListing {
+                entries,
+                total_bytes,
+            });
+        }
+        Err(err) => return Err(FsError::from_io(&err, "the trash")),
+    };
+
+    while let Some(item) = read
+        .next_entry()
+        .await
+        .map_err(|e| FsError::from_io(&e, "the trash"))?
+    {
+        if entries.len() >= MAX_ENTRIES {
+            break;
+        }
+        let Ok(bytes) = tokio::fs::read(item.path().join("info.json")).await else {
+            continue;
+        };
+        let Ok(entry) = serde_json::from_slice::<TrashEntry>(&bytes) else {
+            continue;
+        };
+        // An entry whose payload is gone cannot be restored, so it is not offered.
+        if tokio::fs::symlink_metadata(item.path().join("payload"))
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        total_bytes += entry.size;
+        entries.push(entry);
+    }
+
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.deleted_at));
+    Ok(TrashListing {
+        entries,
+        total_bytes,
+    })
+}
+
+/// Put an entry back where it came from, keeping its new name if the old one is taken.
+async fn restore_trash(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<TrashRestore>,
+) -> Result<Json<FsEntry>, FsError> {
+    let root = state.fs.as_ref().ok_or_else(FsError::fs_disabled)?;
+    root.writable()?;
+    Ok(Json(restore_from_trash(root, &request.id).await?))
+}
+
+/// Put one entry back, wherever its original path is now.
+async fn restore_from_trash(root: &FsRoot, id: &str) -> Result<FsEntry, FsError> {
+    let (holding, entry) = read_trash_entry(root, id).await?;
+    // Restoring writes to the original path, which may since have become protected.
+    root.editable_tree(&entry.path)?;
+
+    // Recreate any folder above the target that has gone away in the meantime, one
+    // component at a time, each one checked to stay inside the root by construction.
+    let mut folder = root.root().to_path_buf();
+    let parent = match entry.path.rsplit_once('/') {
+        Some((parent, _)) => parent.to_owned(),
+        None => String::new(),
+    };
+    for part in parent.split('/').filter(|p| !p.is_empty()) {
+        folder.push(part);
+        if tokio::fs::symlink_metadata(&folder).await.is_err() {
+            tokio::fs::create_dir(&folder)
+                .await
+                .map_err(|e| FsError::from_io(&e, &parent))?;
+        }
+    }
+
+    let target = match tokio::fs::symlink_metadata(folder.join(&entry.name)).await {
+        Ok(_) => unique_restore_name(&folder, &entry.name).await?,
+        Err(_) => folder.join(&entry.name),
+    };
+
+    tokio::fs::rename(holding.join("payload"), &target)
+        .await
+        .map_err(|e| FsError::from_io(&e, &entry.path))?;
+    let _ = tokio::fs::remove_dir_all(&holding).await;
+
+    let meta = tokio::fs::symlink_metadata(&target)
+        .await
+        .map_err(|e| FsError::from_io(&e, &entry.path))?;
+    let restored = root.relative(&target);
+    tracing::info!("fs: restored {} to {}", entry.path, restored);
+    Ok(entry_for(root, &target, &meta))
+}
+
+/// The first free name of the form `note (restored).txt`, so a restore never
+/// overwrites whatever took the original name.
+async fn unique_restore_name(folder: &Path, name: &str) -> Result<PathBuf, FsError> {
+    let (stem, extension) = match name.rsplit_once('.') {
+        // A leading dot is a stem, not an extension: `.env` is not "env with no name".
+        Some((stem, extension)) if !stem.is_empty() => (stem, format!(".{extension}")),
+        _ => (name, String::new()),
+    };
+    for attempt in 1..100 {
+        let suffix = if attempt == 1 {
+            " (restored)".to_owned()
+        } else {
+            format!(" (restored {attempt})")
+        };
+        let candidate = folder.join(format!("{stem}{suffix}{extension}"));
+        if tokio::fs::symlink_metadata(&candidate).await.is_err() {
+            return Ok(candidate);
+        }
+    }
+    Err(FsError::Conflict(format!(
+        "there are already a hundred restored copies of `{name}`"
+    )))
+}
+
+/// Delete for good: one entry, or - with no `id` - everything in the trash.
+async fn purge_trash(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<TrashQuery>,
+) -> Result<StatusCode, FsError> {
+    let root = state.fs.as_ref().ok_or_else(FsError::fs_disabled)?;
+    root.writable()?;
+    purge_from_trash(root, &q.id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Forget one entry, or everything in the trash when `id` is empty.
+async fn purge_from_trash(root: &FsRoot, id: &str) -> Result<(), FsError> {
+    let target = if id.is_empty() {
+        root.resolve(TRASH_DIR)?
+    } else {
+        // Through `resolve`, so the id cannot be a way out of the trash even if it
+        // somehow got past the name check.
+        root.resolve(&format!("{TRASH_DIR}/{}", entry_name(id)?))?
+    };
+
+    match tokio::fs::remove_dir_all(&target).await {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(FsError::from_io(&err, "the trash")),
+    }
+    // The folder itself stays, so the next delete does not have to recreate it.
+    if id.is_empty() {
+        let _ = tokio::fs::create_dir_all(&target).await;
+        tracing::info!("fs: emptied the trash");
+    } else {
+        tracing::info!("fs: purged trash entry {id}");
+    }
+    Ok(())
 }
 
 /// Replace a file's contents without ever leaving it half-written.
@@ -741,6 +1092,7 @@ async fn open_file(
 ) -> Result<(PathBuf, std::fs::Metadata), FsError> {
     let root = state.fs.as_ref().ok_or_else(FsError::fs_disabled)?;
     let path = root.resolve(rel)?;
+    root.refuse_trash(&path)?;
 
     let meta = tokio::fs::metadata(&path)
         .await
@@ -793,9 +1145,11 @@ fn entry_for(root: &FsRoot, path: &Path, meta: &std::fs::Metadata) -> FsEntry {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let relative = root.relative(path);
+    let protected = protected_by(&relative, &root.protected).is_some();
     FsEntry {
         hidden: name.starts_with('.'),
-        path: root.relative(path),
+        path: relative,
         name,
         kind: if meta.is_dir() {
             EntryKind::Dir
@@ -806,7 +1160,7 @@ fn entry_for(root: &FsRoot, path: &Path, meta: &std::fs::Metadata) -> FsEntry {
         },
         size: meta.len(),
         modified: modified_millis(meta.modified().ok()),
-        readonly: meta.permissions().readonly(),
+        readonly: protected || meta.permissions().readonly(),
         blocked: false,
     }
 }
@@ -938,4 +1292,228 @@ fn is_plain_component(part: &str) -> bool {
     Path::new(part)
         .components()
         .all(|c| matches!(c, Component::Normal(_)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh root per test, under the system temp directory. Named uniquely so the
+    /// tests can run in parallel and so a failure leaves something to look at.
+    fn scratch(label: &str, protected: &[&str]) -> FsRoot {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "web-desktop-fs-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (root, _) = FsRoot::new(
+            &dir,
+            true,
+            None,
+            protected.iter().map(|p| (*p).to_owned()).collect(),
+        )
+        .expect("scratch root");
+        root
+    }
+
+    async fn trash(root: &FsRoot, rel: &str) -> Result<TrashEntry, FsError> {
+        let target = root.resolve(rel)?;
+        let meta = tokio::fs::symlink_metadata(&target)
+            .await
+            .expect("metadata");
+        trash_now(root, &target, rel, &meta).await
+    }
+
+    fn read(root: &FsRoot, rel: &str) -> String {
+        std::fs::read_to_string(root.root().join(rel)).expect("readable")
+    }
+
+    #[tokio::test]
+    async fn trashing_keeps_the_file_and_hides_it() {
+        let root = scratch("trash", &[]);
+        std::fs::write(root.root().join("note.txt"), "hello\n").expect("write");
+
+        let entry = trash(&root, "note.txt").await.expect("trashed");
+        assert_eq!(entry.name, "note.txt");
+        assert_eq!(entry.path, "note.txt");
+        assert_eq!(entry.kind, EntryKind::File);
+        assert_eq!(entry.size, 6);
+
+        // Out of the way...
+        assert!(!root.root().join("note.txt").exists());
+        // ...and held, byte for byte, under a name of the trash's choosing.
+        let held = root.root().join(TRASH_DIR).join(&entry.id).join("payload");
+        assert_eq!(std::fs::read_to_string(&held).expect("payload"), "hello\n");
+
+        let listing = gather_trash(&root).await.expect("listing");
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.total_bytes, 6);
+    }
+
+    #[tokio::test]
+    async fn restoring_puts_it_back_where_it_was() {
+        let root = scratch("restore", &[]);
+        std::fs::write(root.root().join("note.txt"), "hello\n").expect("write");
+        let entry = trash(&root, "note.txt").await.expect("trashed");
+
+        let back = restore_from_trash(&root, &entry.id)
+            .await
+            .expect("restored");
+        assert_eq!(back.path, "note.txt");
+        assert_eq!(read(&root, "note.txt"), "hello\n");
+        // The trash does not keep a copy of what it gave back.
+        assert!(
+            gather_trash(&root)
+                .await
+                .expect("listing")
+                .entries
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn restoring_never_overwrites_what_took_the_name() {
+        let root = scratch("collision", &[]);
+        std::fs::write(root.root().join("keep.txt"), "original\n").expect("write");
+        let entry = trash(&root, "keep.txt").await.expect("trashed");
+        std::fs::write(root.root().join("keep.txt"), "replacement\n").expect("write");
+
+        let back = restore_from_trash(&root, &entry.id)
+            .await
+            .expect("restored");
+        assert_eq!(back.path, "keep (restored).txt");
+        assert_eq!(read(&root, "keep.txt"), "replacement\n");
+        assert_eq!(read(&root, "keep (restored).txt"), "original\n");
+    }
+
+    #[tokio::test]
+    async fn restoring_recreates_the_folder_it_was_in() {
+        let root = scratch("vanished", &[]);
+        std::fs::create_dir_all(root.root().join("a/b")).expect("mkdir");
+        std::fs::write(root.root().join("a/b/c.txt"), "deep\n").expect("write");
+        let entry = trash(&root, "a/b/c.txt").await.expect("trashed");
+        std::fs::remove_dir_all(root.root().join("a")).expect("rmdir");
+
+        let back = restore_from_trash(&root, &entry.id)
+            .await
+            .expect("restored");
+        assert_eq!(back.path, "a/b/c.txt");
+        assert_eq!(read(&root, "a/b/c.txt"), "deep\n");
+    }
+
+    #[tokio::test]
+    async fn a_whole_folder_goes_to_the_trash_and_comes_back() {
+        let root = scratch("folder", &[]);
+        std::fs::create_dir_all(root.root().join("projects/one")).expect("mkdir");
+        std::fs::write(root.root().join("projects/one/a.txt"), "a\n").expect("write");
+        std::fs::write(root.root().join("projects/top.txt"), "top\n").expect("write");
+
+        let entry = trash(&root, "projects").await.expect("trashed");
+        assert_eq!(entry.kind, EntryKind::Dir);
+        assert!(!root.root().join("projects").exists());
+
+        restore_from_trash(&root, &entry.id)
+            .await
+            .expect("restored");
+        assert_eq!(read(&root, "projects/one/a.txt"), "a\n");
+        assert_eq!(read(&root, "projects/top.txt"), "top\n");
+    }
+
+    #[tokio::test]
+    async fn a_protected_path_refuses_everything_that_would_change_it() {
+        let root = scratch("protected", &["Lumina"]);
+        std::fs::create_dir_all(root.root().join("Lumina/gallery")).expect("mkdir");
+        std::fs::write(root.root().join("Lumina/gallery/a.png"), "keep me\n").expect("write");
+
+        // Writing inside, creating inside, renaming, deleting: all refused.
+        for rel in [
+            "Lumina",
+            "Lumina/gallery",
+            "Lumina/gallery/a.png",
+            "Lumina/new.txt",
+        ] {
+            assert!(root.editable(rel).is_err(), "{rel} should be protected");
+        }
+        // A neighbour whose name merely starts the same way is not.
+        std::fs::create_dir_all(root.root().join("Luminaria")).expect("mkdir");
+        assert!(root.editable("Luminaria").is_ok());
+        assert!(root.editable("Luminaria/x.txt").is_ok());
+
+        // And a folder *holding* the protected path cannot be moved either, which is
+        // the case a check on the path alone would miss.
+        assert!(root.editable("").is_ok() || root.protected.is_empty());
+        assert!(root.editable_tree("").is_err());
+        assert!(root.editable_tree("Lumina").is_err());
+        assert!(root.editable_tree("other").is_ok());
+
+        // Nothing was touched while all of that was refused.
+        assert_eq!(read(&root, "Lumina/gallery/a.png"), "keep me\n");
+    }
+
+    #[tokio::test]
+    async fn the_trash_is_not_reachable_through_the_file_api() {
+        let root = scratch("sealed", &[]);
+        for rel in [TRASH_DIR, ".trash/1", ".trash/1/payload", "/.trash/x"] {
+            assert!(root.is_trash(rel), "{rel} is in the trash");
+        }
+        for rel in ["trash", "notes/.trash", ".trashed", ""] {
+            assert!(!root.is_trash(rel), "{rel} is not in the trash");
+        }
+        // A path that merely points at it is refused once resolved, which is what the
+        // read and write handlers rely on.
+        std::fs::create_dir_all(root.root().join(TRASH_DIR).join("1")).expect("mkdir");
+        let inside = root.resolve(&format!("{TRASH_DIR}/1")).expect("resolves");
+        assert!(root.refuse_trash(&inside).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_trash_entry_with_no_payload_is_not_offered() {
+        let root = scratch("orphan", &[]);
+        std::fs::write(root.root().join("note.txt"), "x\n").expect("write");
+        let entry = trash(&root, "note.txt").await.expect("trashed");
+
+        // What a crash between the note and the move would leave behind.
+        std::fs::remove_file(root.root().join(TRASH_DIR).join(&entry.id).join("payload"))
+            .expect("remove payload");
+
+        let listing = gather_trash(&root).await.expect("listing");
+        assert!(
+            listing.entries.is_empty(),
+            "an entry that cannot be restored should not be listed"
+        );
+        // It is still on disk, so nothing was lost silently.
+        assert!(
+            root.root()
+                .join(TRASH_DIR)
+                .join(&entry.id)
+                .join("info.json")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn emptying_the_trash_leaves_it_usable() {
+        let root = scratch("empty", &[]);
+        std::fs::write(root.root().join("one.txt"), "1\n").expect("write");
+        std::fs::write(root.root().join("two.txt"), "2\n").expect("write");
+        trash(&root, "one.txt").await.expect("trashed");
+        trash(&root, "two.txt").await.expect("trashed");
+
+        purge_from_trash(&root, "").await.expect("emptied");
+        assert!(
+            gather_trash(&root)
+                .await
+                .expect("listing")
+                .entries
+                .is_empty()
+        );
+
+        // The folder is still there, so the next delete does not have to think about it.
+        let entry = trash(&root, "one.txt").await;
+        assert!(entry.is_err() || gather_trash(&root).await.expect("listing").entries.len() <= 1);
+        assert!(root.root().join(TRASH_DIR).is_dir());
+    }
 }

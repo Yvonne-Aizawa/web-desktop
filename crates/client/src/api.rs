@@ -4,7 +4,8 @@ use gloo_net::http::{Request, Response};
 use serde::de::DeserializeOwned;
 use shared::fs::{
     API_FS_CONTENT, API_FS_DELETE, API_FS_DIR, API_FS_DOWNLOAD, API_FS_ENTRY, API_FS_LIST,
-    API_FS_PREVIEW, API_FS_RAW, ApiError, DirListing, FilePreview, FsEntry, FsMutation,
+    API_FS_PREVIEW, API_FS_RAW, API_FS_TRASH, API_FS_TRASH_RESTORE, ApiError, DirListing,
+    FilePreview, FsEntry, FsMutation, TrashEntry, TrashListing, TrashRestore,
 };
 use shared::{API_CATALOG, API_HEALTH, Catalog, Health};
 
@@ -85,13 +86,33 @@ pub async fn rename_entry(path: &str, name: &str) -> Result<FsEntry, String> {
     send(request).await
 }
 
-/// Delete a file, or a directory when `recursive` is set.
-pub async fn delete_entry(path: &str, recursive: bool) -> Result<(), String> {
-    let url = format!(
-        "{}?path={}&recursive={recursive}",
-        API_FS_DELETE,
-        encode_query(path)
-    );
+/// Move a file, or a directory, to the trash. The answer describes what was moved, so
+/// the caller can offer to put it back.
+pub async fn delete_entry(path: &str) -> Result<TrashEntry, String> {
+    let url = format!("{}?path={}", API_FS_DELETE, encode_query(path));
+    let request = Request::delete(&url)
+        .build()
+        .map_err(|err| format!("could not build the request: {err}"))?;
+    send(request).await
+}
+
+pub async fn list_trash() -> Result<TrashListing, String> {
+    get_json(API_FS_TRASH).await
+}
+
+/// Put a trashed entry back. It returns to the path it came from, under a new name if
+/// something has taken that path in the meantime, so the answer is the entry to show.
+pub async fn restore_trash(id: &str) -> Result<FsEntry, String> {
+    let body = TrashRestore { id: id.to_owned() };
+    let request = Request::post(API_FS_TRASH_RESTORE)
+        .json(&body)
+        .map_err(|err| format!("could not build the request: {err}"))?;
+    send(request).await
+}
+
+/// Forget one entry, or - with an empty id - everything in the trash.
+pub async fn purge_trash(id: &str) -> Result<(), String> {
+    let url = format!("{}?id={}", API_FS_TRASH, encode_query(id));
     let request = Request::delete(&url)
         .build()
         .map_err(|err| format!("could not build the request: {err}"))?;

@@ -16,9 +16,11 @@
 //! same signals without threading closures through props. Each Files window creates
 //! its own, so two of them do not share a directory, a selection or an editor.
 
+use gloo_timers::callback::Timeout;
 use leptos::prelude::*;
 use shared::fs::{
-    DirListing, EntryKind, FilePreview, FsEntry, PreviewBody, image_mime, looks_like_image,
+    DirListing, EntryKind, FilePreview, FsEntry, PreviewBody, TrashEntry, TrashListing, image_mime,
+    looks_like_image,
 };
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
@@ -38,6 +40,13 @@ enum Load {
     Loading,
     Ready(DirListing),
     Failed(String),
+}
+
+/// Which pane the window is showing.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Browse,
+    Trash,
 }
 
 /// What the toolbar's inline prompt is asking for.
@@ -80,6 +89,15 @@ struct FsView {
     busy: RwSignal<bool>,
     /// `(is_error, message)` shown under the toolbar.
     notice: RwSignal<Option<(bool, String)>>,
+    /// Browsing the sandbox, or looking at what was deleted.
+    mode: RwSignal<Mode>,
+    /// The trash listing, loaded on demand rather than with every directory.
+    /// `None` means "not fetched yet", so an empty trash and an unasked question do
+    /// not look the same.
+    trash: RwSignal<Option<Result<TrashListing, String>>>,
+    trash_refresh: RwSignal<u32>,
+    /// The last thing deleted, offered back until something else happens.
+    undo: RwSignal<Option<TrashEntry>>,
 }
 
 impl FsView {
@@ -99,7 +117,11 @@ impl FsView {
         self.notice.set(Some((true, message.into())));
     }
 
+    /// Go to a folder. Also leaves the trash view: a place in the sidebar or a folder
+    /// in the listing means browsing, and a pane that stayed on the trash while the
+    /// path said otherwise would be lying about which of the two it is showing.
     fn navigate(self, path: String) {
+        self.mode.set(Mode::Browse);
         self.cwd.set(path);
     }
 
@@ -181,10 +203,146 @@ impl FsView {
         }
     }
 
-    fn delete(self, path: String, recursive: bool) {
-        self.run(format!("Deleted {path}"), async move {
-            api::delete_entry(&path, recursive).await
+    /// Move something to the trash.
+    ///
+    /// No confirmation: the point of a trash is that this is reversible, and a dialog
+    /// that says "really delete?" while nothing is really deleted teaches the user not
+    /// to believe dialogs. The undo bar is the honest version of that confirmation.
+    fn delete(self, path: String) {
+        self.busy.set(true);
+        self.notice.set(None);
+        spawn_local(async move {
+            match api::delete_entry(&path).await {
+                Ok(entry) => {
+                    self.say(format!("Moved {} to the trash", entry.name));
+                    self.undo.set(Some(entry));
+                    self.reload();
+                    self.load_trash();
+                }
+                Err(err) => self.warn(err),
+            }
+            self.busy.set(false);
         });
+    }
+
+    /// Put back what was just deleted.
+    fn undo_delete(self) {
+        let Some(entry) = self.undo.get_untracked() else {
+            return;
+        };
+        self.undo.set(None);
+        self.busy.set(true);
+        spawn_local(async move {
+            match api::restore_trash(&entry.id).await {
+                Ok(back) => {
+                    self.say(format!("Put {} back", back.path));
+                    self.reload();
+                    self.load_trash();
+                }
+                Err(err) => self.warn(err),
+            }
+            self.busy.set(false);
+        });
+    }
+
+    fn restore(self, entry: TrashEntry) {
+        self.busy.set(true);
+        self.notice.set(None);
+        spawn_local(async move {
+            match api::restore_trash(&entry.id).await {
+                Ok(back) => {
+                    self.say(format!("Put {} back", back.path));
+                    self.reload();
+                    self.load_trash();
+                }
+                Err(err) => self.warn(err),
+            }
+            self.busy.set(false);
+        });
+    }
+
+    /// Delete from the trash, which is the irreversible one.
+    fn purge(self, id: String) {
+        self.busy.set(true);
+        self.notice.set(None);
+        spawn_local(async move {
+            match api::purge_trash(&id).await {
+                Ok(()) => {
+                    self.say("Deleted for good");
+                    self.load_trash();
+                }
+                Err(err) => self.warn(err),
+            }
+            self.busy.set(false);
+        });
+    }
+
+    fn empty_trash(self) {
+        self.busy.set(true);
+        self.confirming.set(false);
+        self.notice.set(None);
+        spawn_local(async move {
+            match api::purge_trash("").await {
+                Ok(()) => {
+                    self.say("Emptied the trash");
+                    self.load_trash();
+                }
+                Err(err) => self.warn(err),
+            }
+            self.busy.set(false);
+        });
+    }
+
+    fn show_trash(self, on: bool) {
+        self.mode.set(if on { Mode::Trash } else { Mode::Browse });
+        self.undo.set(None);
+        if on {
+            self.trash.set(None);
+            self.load_trash();
+        }
+    }
+
+    fn load_trash(self) {
+        self.trash_refresh.update(|n| *n += 1);
+    }
+
+    /// Move the folder being viewed to the trash, then step out to its parent.
+    ///
+    /// Folders are entered by a single click rather than selected, so they have no
+    /// preview pane to act from; the toolbar is where the folder you are inside can be
+    /// renamed or deleted, which is also the only place it makes sense to offer it.
+    fn delete_current(self) {
+        let path = self.cwd.get_untracked();
+        if path.is_empty() {
+            return;
+        }
+        let parent = path
+            .rsplit_once('/')
+            .map(|(parent, _)| parent.to_owned())
+            .unwrap_or_default();
+        self.busy.set(true);
+        self.notice.set(None);
+        spawn_local(async move {
+            match api::delete_entry(&path).await {
+                Ok(entry) => {
+                    // Leave before the folder on screen stops existing.
+                    self.navigate(parent);
+                    self.say(format!("Moved {} to the trash", entry.name));
+                    self.undo.set(Some(entry));
+                    self.reload();
+                    self.load_trash();
+                }
+                Err(err) => self.warn(err),
+            }
+            self.busy.set(false);
+        });
+    }
+
+    /// Whether the folder on screen is one the server protects, so the toolbar can
+    /// leave out the buttons that would only come back as a refusal.
+    fn cwd_protected(self) -> bool {
+        let fs = self.desktop.fs.get();
+        shared::fs::protected_by(&self.cwd.get(), &fs.readonly_paths).is_some()
     }
 
     fn upload(self, file: web_sys::File) {
@@ -241,6 +399,10 @@ pub fn Files() -> impl IntoView {
         confirming: RwSignal::new(false),
         busy: RwSignal::new(false),
         notice: RwSignal::new(None),
+        mode: RwSignal::new(Mode::Browse),
+        trash: RwSignal::new(None),
+        trash_refresh: RwSignal::new(0),
+        undo: RwSignal::new(None),
     };
     provide_context(state);
 
@@ -283,6 +445,18 @@ pub fn Files() -> impl IntoView {
         });
     });
 
+    // The trash is fetched when it is asked for, and again after any change to it.
+    Effect::new(move |_| {
+        if state.mode.get() != Mode::Trash {
+            return;
+        }
+        state.trash_refresh.track();
+        spawn_local(async move {
+            let listing = api::list_trash().await;
+            state.trash.set(Some(listing));
+        });
+    });
+
     view! {
         <div class="app files">
             <Show
@@ -300,12 +474,207 @@ pub fn Files() -> impl IntoView {
             >
                 <Sidebar />
                 <div class="files-main">
-                    <Toolbar />
-                    <Listing />
-                    <PreviewPane />
+                    <UndoBar />
+                    <Show when=move || state.mode.get() == Mode::Browse fallback=|| view! { <TrashView /> }>
+                        <Toolbar />
+                        <Listing />
+                        <PreviewPane />
+                    </Show>
                 </div>
             </Show>
         </div>
+    }
+}
+
+/// The one-shot offer to undo, shown after a delete.
+///
+/// It carries the second half of "delete is safe now": the trash holds the file
+/// whether or not you notice, and this is the shortcut for the common case where you
+/// deleted the wrong thing a second ago.
+#[component]
+fn UndoBar() -> impl IntoView {
+    let state = expect_context::<FsView>();
+
+    // Clear itself if it is left alone, but only if it is still showing the same
+    // entry: two deletes in a row must not have the first one's timer wipe the second.
+    Effect::new(move |_| {
+        let Some(entry) = state.undo.get() else {
+            return;
+        };
+        let id = entry.id.clone();
+        let state = state;
+        Timeout::new(12_000, move || {
+            if state.undo.get_untracked().map(|held| held.id) == Some(id.clone()) {
+                state.undo.set(None);
+            }
+        })
+        .forget();
+    });
+
+    view! {
+        <Show when=move || state.undo.get().is_some()>
+            <div class="undo-bar">
+                <span class="undo-text">
+                    {move || {
+                        state
+                            .undo
+                            .get()
+                            .map(|entry| format!("Moved {} to the trash", entry.name))
+                            .unwrap_or_default()
+                    }}
+                </span>
+                <button class="ghost-btn" on:click=move |_| state.undo_delete()>
+                    "↩ Undo"
+                </button>
+                <button
+                    class="icon-btn"
+                    title="Dismiss"
+                    on:click=move |_| state.undo.set(None)
+                >
+                    "✕"
+                </button>
+            </div>
+        </Show>
+    }
+}
+
+/// What has been deleted: put it back, or delete it for good.
+#[component]
+fn TrashView() -> impl IntoView {
+    let state = expect_context::<FsView>();
+    let deleting = move || state.confirming.get();
+
+    let listing = move || state.trash.get().and_then(Result::ok);
+    let failure = move || state.trash.get().and_then(Result::err);
+    let empty = move || {
+        listing()
+            .map(|listing| listing.entries.is_empty())
+            .unwrap_or(false)
+    };
+
+    view! {
+        <div class="trash-view">
+            <div class="trash-head">
+                <span class="trash-title">"Trash"</span>
+                <span class="preview-meta">
+                    {move || {
+                        listing()
+                            .map(|listing| {
+                                if listing.entries.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        "{} ({} held)",
+                                        human_size(listing.total_bytes),
+                                        count(listing.entries.len()),
+                                    )
+                                }
+                            })
+                            .unwrap_or_default()
+                    }}
+                </span>
+                <span class="spacer"></span>
+                <button
+                    class="ghost-btn"
+                    on:click=move |_| state.show_trash(false)
+                >
+                    "← Back to files"
+                </button>
+                <button
+                    class="ghost-btn danger"
+                    class:confirming=deleting
+                    style=move || if empty() { "display:none" } else { "" }
+                    on:click=move |_| {
+                        if state.confirming.get_untracked() {
+                            state.empty_trash();
+                        } else {
+                            state.confirming.set(true);
+                        }
+                    }
+                >
+                    {move || {
+                        if deleting() { "Really delete everything?" } else { "Empty trash" }
+                    }}
+                </button>
+            </div>
+
+            <Show when=move || failure().is_some()>
+                <div class="files-status error">
+                    {move || failure().unwrap_or_default()}
+                </div>
+            </Show>
+
+            <Show when=move || empty() && failure().is_none()>
+                <div class="files-status">
+                    <strong>"The trash is empty."</strong>
+                    <span>"Deleting a file moves it here, so it can be put back."</span>
+                </div>
+            </Show>
+
+            <Show when=move || !empty() && failure().is_none()>
+                <div class="trash-list">
+                    <For
+                        each=move || listing().map(|l| l.entries).unwrap_or_default()
+                        key=|entry| entry.id.clone()
+                        let:entry
+                    >
+                        <TrashRow entry=entry />
+                    </For>
+                </div>
+            </Show>
+
+            <Show when=move || state.trash.get().is_none()>
+                <div class="files-status">"Reading the trash…"</div>
+            </Show>
+        </div>
+    }
+}
+
+#[component]
+fn TrashRow(entry: TrashEntry) -> impl IntoView {
+    let state = expect_context::<FsView>();
+    let restore_id = entry.id.clone();
+    let purge_id = entry.id.clone();
+    let glyph = if entry.kind == EntryKind::Dir {
+        "📁"
+    } else {
+        "📄"
+    };
+
+    view! {
+        <div class="trash-row">
+            <span class="trash-glyph">{glyph}</span>
+            <span class="trash-name" title=entry.path.clone()>{entry.name.clone()}</span>
+            <span class="preview-meta trash-where">{entry.path.clone()}</span>
+            <span class="preview-meta">{human_size(entry.size)}</span>
+            <span class="preview-meta">{format_millis(entry.deleted_at)}</span>
+            <button
+                class="ghost-btn"
+                title="Put this back where it came from"
+                on:click=move |_| state.restore(TrashEntry {
+                    id: restore_id.clone(),
+                    ..entry.clone()
+                })
+            >
+                "↩ Restore"
+            </button>
+            <button
+                class="ghost-btn danger"
+                title="Delete for good: this cannot be undone"
+                on:click=move |_| state.purge(purge_id.clone())
+            >
+                "Delete forever"
+            </button>
+        </div>
+    }
+}
+
+/// "1 entry" / "3 entries", so the header does not read like a template.
+fn count(n: usize) -> String {
+    if n == 1 {
+        "1 entry".to_owned()
+    } else {
+        format!("{n} entries")
     }
 }
 
@@ -326,6 +695,16 @@ fn Sidebar() -> impl IntoView {
                 "Root"
             </button>
 
+            <button
+                class="side-item"
+                class:active=move || state.mode.get() == Mode::Trash
+                title="What has been deleted, and can be put back"
+                on:click=move |_| state.show_trash(true)
+            >
+                <span class="side-dot trash"></span>
+                "Trash"
+            </button>
+
             <div class="side-label">"Options"</div>
             <label class="toggle">
                 <input
@@ -341,7 +720,8 @@ fn Sidebar() -> impl IntoView {
                 when=move || fs().writable
                 fallback=move || {
                     view! {
-                        <p class="side-fine side-readonly">
+                        <p class="side-fine side-readonly" title="The backend decides this, not the UI">
+                            <strong>"Read-only: "</strong>
                             <strong>"Read-only. "</strong>
                             {move || {
                                 fs()
@@ -367,6 +747,10 @@ fn Sidebar() -> impl IntoView {
 #[component]
 fn Toolbar() -> impl IntoView {
     let state = expect_context::<FsView>();
+    let cwd_protected = move || state.cwd_protected();
+    // The root itself is not a folder you can delete, and a protected one is not either.
+    let folder_actions =
+        move || state.writable() && !state.cwd.get().is_empty() && !cwd_protected();
     let upload_input = NodeRef::<leptos::html::Input>::new();
 
     let crumbs = move || {
@@ -444,7 +828,45 @@ fn Toolbar() -> impl IntoView {
 
             <span class="count">{summary}</span>
 
-            <Show when=move || state.writable()>
+            <Show when=move || folder_actions()>
+                <button
+                    class="ghost-btn"
+                    title="Rename this folder"
+                    on:click=move |_| {
+                        let current = state
+                            .cwd
+                            .get_untracked()
+                            .rsplit_once('/')
+                            .map(|(_, name)| name.to_owned())
+                            .unwrap_or_else(|| state.cwd.get_untracked());
+                        state.prompt_value.set(current.clone());
+                        state.prompt.set(Some(Prompt::Rename {
+                            path: state.cwd.get_untracked(),
+                            current,
+                        }));
+                    }
+                >
+                    "✎ Rename this folder"
+                </button>
+                <button
+                    class="ghost-btn danger"
+                    title="Move this folder, and everything in it, to the trash"
+                    on:click=move |_| state.delete_current()
+                >
+                    "🗑 Delete this folder"
+                </button>
+            </Show>
+
+            <Show when=cwd_protected>
+                <span
+                    class="preview-meta locked"
+                    title="The server keeps this folder read-only; remove it from WEB_DESKTOP_FS_READONLY to change that."
+                >
+                    "🔒 read-only folder"
+                </span>
+            </Show>
+
+            <Show when=move || state.writable() && !cwd_protected()>
                 <button
                     class="ghost-btn"
                     title="New folder"
@@ -738,7 +1160,10 @@ fn preview_head(entry: FsEntry) -> AnyView {
 
     let downloadable = entry.kind == EntryKind::File && !entry.blocked;
     let is_dir = entry.kind == EntryKind::Dir;
-    let editable = state.writable() && !entry.blocked && !entry.path.is_empty();
+    // Protected entries arrive with `readonly` set, which is the server's own answer
+    // about whether it would refuse: the UI hides the affordance rather than letting
+    // the user discover it through an error.
+    let editable = state.writable() && !entry.blocked && !entry.readonly && !entry.path.is_empty();
     let meta = if downloadable {
         human_size(entry.size)
     } else {
@@ -759,7 +1184,7 @@ fn preview_head(entry: FsEntry) -> AnyView {
 
     let actions_visible = move || editable;
     let rename_visible = move || editable && !is_dir;
-    let deleting = move || state.confirming.get();
+    let locked = entry.readonly;
 
     view! {
         <div class="preview-head">
@@ -810,34 +1235,25 @@ fn preview_head(entry: FsEntry) -> AnyView {
                 </button>
                 <button
                     class="ghost-btn danger"
-                    class:confirming=deleting
-                    on:click=move |_| {
-                        if state.confirming.get_untracked() {
-                            state.confirming.set(false);
-                            state.delete(delete_path.clone(), is_dir);
-                        } else {
-                            state.confirming.set(true);
-                        }
-                    }
+                    title="Move this to the trash; it can be put back from there"
+                    on:click=move |_| state.delete(delete_path.clone())
                 >
-                    {move || {
-                        if !deleting() {
-                            "🗑 Delete"
-                        } else if is_dir {
-                            "Really delete folder and contents?"
-                        } else {
-                            "Really delete?"
-                        }
-                    }}
+                    "🗑 Delete"
                 </button>
             </div>
 
             <span
-                class="preview-meta"
-                title="See the sidebar for why"
-                style=move || if state.writable() { "display:none" } else { "" }
+                class="preview-meta locked"
+                title=move || {
+                    if locked {
+                        "This is inside a folder the server keeps read-only (WEB_DESKTOP_FS_READONLY)."
+                    } else {
+                        "See the sidebar for why."
+                    }
+                }
+                style=move || if state.writable() && !locked { "display:none" } else { "" }
             >
-                "read-only"
+                {if locked { "🔒 read-only" } else { "read-only" }}
             </span>
         </div>
     }

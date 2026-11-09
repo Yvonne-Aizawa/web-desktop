@@ -18,6 +18,9 @@
 //!   WEB_DESKTOP_ADDR  listen address, default 127.0.0.1:8080
 //!   WEB_DESKTOP_ROOT  directory the file browser may read, default ~/web-desktop
 //!   WEB_DESKTOP_FS    set to `off` to disable the filesystem API entirely
+//!   WEB_DESKTOP_FS_READONLY
+//!                     comma-separated paths inside the root that stay read-only
+//!                     however writable the rest is, e.g. `Lumina,archive`
 //!   WEB_DESKTOP_FS_WRITE
 //!                     `on`/`off` for the write endpoints. Default: on for the
 //!                     sandbox this server creates itself, off for a root chosen
@@ -278,11 +281,16 @@ fn init_fs() -> Result<Option<FsRoot>, String> {
     });
     let writable = requested.unwrap_or(!chosen_root);
     let readonly_reason = (!writable).then(|| match requested {
-        Some(_) => "editing is switched off on this server (WEB_DESKTOP_FS_WRITE=off)".to_owned(),
+        Some(_) => "editing is switched off on this server (WEB_DESKTOP_FS_WRITE=off); start it with WEB_DESKTOP_FS_WRITE=on to allow changes".to_owned(),
         None => "this root was chosen with WEB_DESKTOP_ROOT, so it is read-only until you start the server with WEB_DESKTOP_FS_WRITE=on".to_owned(),
     });
 
-    let (root, created) = FsRoot::new(&path, writable, readonly_reason)
+    let protected = protected_paths();
+    if !protected.is_empty() {
+        tracing::info!("read-only inside the root: {}", protected.join(", "));
+    }
+
+    let (root, created) = FsRoot::new(&path, writable, readonly_reason, protected)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     if created {
         tracing::info!("created sandbox at {}", root.root().display());
@@ -291,6 +299,44 @@ fn init_fs() -> Result<Option<FsRoot>, String> {
         }
     }
     Ok(Some(root))
+}
+
+/// Paths from `WEB_DESKTOP_FS_READONLY`, cleaned into the same root-relative shape the
+/// rest of the fence uses.
+///
+/// A rule that cannot be understood is dropped with a warning rather than kept in some
+/// half-working form: a protection that silently protects the wrong thing, or nothing,
+/// is worse than no protection and a line in the log.
+fn protected_paths() -> Vec<String> {
+    let raw = std::env::var("WEB_DESKTOP_FS_READONLY").unwrap_or_default();
+    let mut kept: Vec<String> = Vec::new();
+    for piece in raw.split(',') {
+        let piece = piece.trim().trim_matches('/');
+        if piece.is_empty() {
+            continue;
+        }
+        let mut parts = Vec::new();
+        let mut ok = true;
+        for part in piece.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    tracing::warn!(
+                        "ignoring WEB_DESKTOP_FS_READONLY rule `{piece}`: it contains `..`"
+                    );
+                    ok = false;
+                    break;
+                }
+                other => parts.push(other),
+            }
+        }
+        if ok && !parts.is_empty() {
+            kept.push(parts.join("/"));
+        }
+    }
+    kept.sort();
+    kept.dedup();
+    kept
 }
 
 /// Fill a brand new sandbox with a few files, so the first run shows something

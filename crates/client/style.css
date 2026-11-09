@@ -503,6 +503,9 @@ button {
 
 .files-bar {
   display: flex;
+  /* The buttons wrap to a second line rather than squeezing the path: the crumbs
+     shrink to nothing under flex pressure, which makes them unclickable. */
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   padding: 10px 12px;
@@ -510,7 +513,7 @@ button {
 }
 
 .crumbs {
-  flex: 1;
+  flex: 1 1 9rem;
   min-width: 0;
   display: flex;
   align-items: center;
@@ -1732,4 +1735,122 @@ button {
   .start-menu {
     animation: none;
   }
+}
+
+/* --- the trash, and the undo bar ------------------------------------------- */
+
+.side-dot.trash {
+  background: #facc15;
+}
+
+/* Sits under the toolbar and disappears on its own: an offer, not a control. */
+.undo-bar {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--stroke);
+  background: rgba(96, 165, 250, 0.1);
+  font-size: 12.5px;
+}
+
+.undo-text {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.icon-btn {
+  margin-left: auto;
+  padding: 2px 7px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: none;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.icon-btn:hover {
+  border-color: var(--stroke-strong);
+  color: var(--text);
+}
+
+.spacer {
+  flex: 1;
+}
+
+.trash-view {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.trash-head {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--stroke);
+}
+
+.trash-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.trash-list {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 4px 0;
+}
+
+.trash-row {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  font-size: 12.5px;
+}
+
+.trash-row:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.trash-glyph {
+  flex: none;
+  width: 18px;
+  text-align: center;
+}
+
+.trash-name {
+  flex: none;
+  max-width: 24ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Where it came from matters more than the name once several look alike. */
+.trash-where {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+.trash-row .ghost-btn {
+  flex: none;
+}
+
+.preview-meta.locked {
+  color: #facc15;
 }

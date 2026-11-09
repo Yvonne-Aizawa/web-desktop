@@ -211,6 +211,38 @@ cargo xtask build-app crates/apps/calculator  # stages apps/calculator/<version>
 cargo xtask precompress apps                  # if the browser is to get it compressed
 ```
 
+### Deleting, and the trash
+
+Delete moves things into `<root>/.trash/` — a rename, so it costs nothing and works on a
+folder of any size — and the Files app offers an **Undo** straight afterwards, plus a
+trash view where anything can be put back or removed for good. The one confirmation
+dialog left in the file browser is emptying the trash, because that is the only step
+that cannot be taken back.
+
+What that buys, and what it costs:
+
+* **A delete you cannot regret.** The bytes stay until you empty the trash, and restoring
+  puts an entry back at its original path, in its original folder (recreating it if it
+  has gone), under a new name if something has taken the old one.
+* **The trash is the browser's, not yours.** It is the one folder the file API will not
+  list, read or modify; it is reached through its own endpoints, so it can neither be
+  deleted by accident nor get in the way of your own files. It is never listed, not even
+  with hidden files shown.
+* **`?permanent=true` still exists** on the delete endpoint for a script that means it;
+  the desktop itself always trashes.
+
+### Keeping something read-only
+
+`WEB_DESKTOP_FS_READONLY=Lumina,archive` keeps those paths untouchable *inside* a
+writable root: reading, previewing and copying out all work, while writing, creating,
+renaming, moving and deleting are refused by the server with the rule that stopped them.
+Deleting a folder that *holds* a protected path is refused too, which is the case a check
+on the path alone would miss.
+
+This is the difference between a convention and a guarantee. Telling an agent "do not
+touch `Lumina`" is a convention; putting it in the config is a guarantee, and it is also
+enforced against the file browser itself, which until now would happily delete it.
+
 ### Configuration
 
 The server reads its settings from the environment, and loads a `.env` file first if
@@ -229,6 +261,7 @@ cp .env.example .env      # then edit
 | `WEB_DESKTOP_ROOT` | `~/web-desktop` | The one directory the file browser may touch |
 | `WEB_DESKTOP_FS` | on | `off` disables the file API |
 | `WEB_DESKTOP_FS_WRITE` | on for the sandbox, off for a chosen root | `on`/`off` for editing |
+| `WEB_DESKTOP_FS_READONLY` | empty | Paths inside the root that stay read-only, e.g. `Lumina,archive` |
 | `WEB_DESKTOP_PROXY_HOSTS` | empty (off) | Hosts the outbound proxy may reach |
 | `WEB_DESKTOP_PROXY_ALLOW_PRIVATE` | off | Also allow private and loopback addresses |
 | `WEB_DESKTOP_APPS` | `apps` | Where built app bundles live |
