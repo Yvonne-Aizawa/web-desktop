@@ -21,7 +21,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
 
 use axum::{Json, Router, extract::State, routing::get};
 use shared::{API_CATALOG, API_HEALTH, Catalog, Health, default_catalog};
-use tower_http::{services::ServeDir, trace::TraceLayer};
+use tower_http::{compression::CompressionLayer, services::ServeDir, trace::TraceLayer};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::fs::FsRoot;
@@ -98,6 +98,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }),
         )
     }
+    // The wasm bundle is ~2.8 MB raw and ~370 KB gzipped, so this is the single
+    // biggest win for load time. tower-http's default predicate compresses
+    // everything except images (SVG is an exception), gRPC, SSE and bodies under
+    // 32 bytes, so the image endpoint does not pay for it.
+    .layer(CompressionLayer::new())
     .layer(TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind(addr).await?;

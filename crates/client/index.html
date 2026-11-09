@@ -6,6 +6,9 @@
     <meta name="color-scheme" content="dark" />
     <title>Web Desktop</title>
     <link data-trunk rel="css" href="style.css" />
+    <!-- Trunk only runs wasm-opt when a rust link asks for it; `z` is -Oz.
+         The pin in Trunk.toml alone is not enough, it just picks the version. -->
+    <link data-trunk rel="rust" data-wasm-opt="z" />
     <link
       rel="icon"
       href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23131a2b'/%3E%3Crect x='6' y='8' width='20' height='13' rx='2' fill='none' stroke='%234ade80' stroke-width='2'/%3E%3Cpath d='M6 25h20' stroke='%2360a5fa' stroke-width='2'/%3E%3C/svg%3E"

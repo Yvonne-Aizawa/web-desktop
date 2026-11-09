@@ -26,12 +26,21 @@ pub const TASKBAR_HEIGHT: f64 = 52.0;
 /// Cascade step for newly opened windows.
 const CASCADE: f64 = 34.0;
 
+/// Handle to an app in the shell's registry.
+///
+/// A small index rather than the manifest itself, because [`WinData`] has to stay
+/// `Copy`: all windows live in one signal, and that is what makes a drag repaint a
+/// single window. Served apps (stage 1) carry owned metadata such as entry URLs and
+/// hashes, so the window record can only hold a handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AppRef(u32);
+
 /// Geometry of one window. `Copy` on purpose: every field is a scalar, which is
 /// what lets the whole list live in a single signal cheaply.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WinData {
     pub id: u32,
-    pub app: AppId,
+    pub app: AppRef,
     pub x: f64,
     pub y: f64,
     pub w: f64,
@@ -45,18 +54,6 @@ pub struct WinData {
 }
 
 impl WinData {
-    pub const fn title(self) -> &'static str {
-        self.app.name()
-    }
-
-    pub const fn glyph(self) -> &'static str {
-        self.app.glyph()
-    }
-
-    pub const fn accent(self) -> &'static str {
-        self.app.accent()
-    }
-
     /// Keep a strip of the title bar on screen so a window can always be grabbed.
     pub fn clamped(mut self) -> Self {
         const KEEP_X: f64 = 112.0;
@@ -69,9 +66,9 @@ impl WinData {
         self
     }
 
-    /// Inline style for the window frame. `--accent` feeds the title bar color.
-    pub fn css(self) -> String {
-        let accent = self.accent();
+    /// Inline style for the window frame. `--accent` feeds the title bar color and
+    /// comes from the registry rather than the record, so this stays `Copy`.
+    pub fn css(&self, accent: &str) -> String {
         if self.maximized {
             format!(
                 "left:0;top:0;width:100%;height:100%;z-index:{};--accent:{accent};",
@@ -94,8 +91,12 @@ impl WinData {
 #[derive(Clone, Copy)]
 pub struct Desktop {
     pub windows: RwSignal<Vec<WinData>>,
-    /// Catalog as advertised by the backend, preloaded with the shared default.
+    /// What the server advertises *right now*. Drives the start menu and About.
     pub catalog: RwSignal<Vec<AppManifest>>,
+    /// Append-only registry behind [`AppRef`], with catalogue entries written in by
+    /// [`Desktop::intern`]. Indices never move, so a catalog refresh can add or
+    /// relabel apps without a window suddenly pointing at a different one.
+    registry: RwSignal<Vec<AppManifest>>,
     pub wallpapers: RwSignal<Vec<Wallpaper>>,
     pub wallpaper: RwSignal<String>,
     /// What the backend is willing to expose to the Files app.
@@ -103,6 +104,10 @@ pub struct Desktop {
     pub start_open: RwSignal<bool>,
     /// `None` while the first request is in flight, `Some(Err)` if it failed.
     pub health: RwSignal<Option<Result<Health, String>>>,
+    /// Kept separate from [`Self::health`] on purpose: the two requests can fail
+    /// independently, and a successful health check used to overwrite a failed
+    /// catalog silently, leaving the menu short of apps with nothing to explain it.
+    pub catalog_error: RwSignal<Option<String>>,
     next_id: RwSignal<u32>,
     next_z: RwSignal<u32>,
 }
@@ -119,11 +124,13 @@ impl Desktop {
         Self {
             windows: RwSignal::new(Vec::new()),
             catalog: RwSignal::new(fallback.apps),
+            registry: RwSignal::new(Vec::new()),
             wallpapers: RwSignal::new(fallback.wallpapers),
             wallpaper: RwSignal::new(initial_wallpaper()),
             fs: RwSignal::new(FsInfo::disabled()),
             start_open: RwSignal::new(false),
             health: RwSignal::new(None),
+            catalog_error: RwSignal::new(None),
             next_id: RwSignal::new(1),
             next_z: RwSignal::new(1),
         }
@@ -168,8 +175,86 @@ impl Desktop {
         self.focused() == Some(id)
     }
 
+    /// Intern an app and get a handle to it. Idempotent per slug, so reopening an
+    /// app or refreshing the catalog never allocates a second handle for it.
+    pub fn intern(self, manifest: &AppManifest) -> AppRef {
+        let existing = self
+            .registry
+            .with_untracked(|r| r.iter().position(|a| a.id == manifest.id));
+
+        match existing {
+            Some(index) => {
+                // Keep the newest labels for an app that is already open.
+                self.registry.update(|r| r[index] = manifest.clone());
+                AppRef(index as u32)
+            }
+            None => {
+                let index = self.registry.with_untracked(|r| r.len()) as u32;
+                self.registry.update(|r| r.push(manifest.clone()));
+                AppRef(index)
+            }
+        }
+    }
+
+    /// The descriptor behind a handle.
+    ///
+    /// Untracked on purpose. A window's app is fixed for its lifetime, and a
+    /// tracked read inside a keyed row would let a catalog refresh re-run the row's
+    /// builder and remount the app, throwing away its state (terminal scrollback,
+    /// current directory).
+    pub fn manifest(self, app: AppRef) -> AppManifest {
+        self.registry
+            .with_untracked(|r| r.get(app.0 as usize).cloned())
+            .unwrap_or_else(AppManifest::placeholder)
+    }
+
+    /// Open (or raise) an app from a catalog entry.
+    pub fn open_manifest(self, manifest: &AppManifest) {
+        self.open(self.intern(manifest));
+    }
+
+    /// Open a built-in by enum, preferring the catalog's copy of it so a
+    /// server-supplied label or size wins over the compiled-in default.
+    pub fn open_builtin(self, id: AppId) {
+        let manifest = self
+            .catalog
+            .with_untracked(|apps| apps.iter().find(|a| a.builtin_id() == Some(id)).cloned())
+            .unwrap_or_else(|| AppManifest::builtin(id));
+        self.open_manifest(&manifest);
+    }
+
+    /// Open by slug, for the terminal's `open` command. Fails only when nothing
+    /// advertises or implements the slug.
+    pub fn open_slug(self, slug: &str) -> Result<(), String> {
+        let advertised = self
+            .catalog
+            .with_untracked(|apps| apps.iter().find(|a| a.id == slug).cloned());
+
+        match advertised {
+            Some(manifest) => {
+                self.open_manifest(&manifest);
+                Ok(())
+            }
+            None => match AppId::from_slug(slug) {
+                Some(id) => {
+                    self.open_builtin(id);
+                    Ok(())
+                }
+                None => {
+                    let known = self.catalog.with_untracked(|apps| {
+                        apps.iter()
+                            .map(|a| a.id.clone())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    });
+                    Err(format!("unknown app `{slug}` (try: {known})"))
+                }
+            },
+        }
+    }
+
     /// Open an app, or raise its window if it is already running.
-    pub fn open(self, app: AppId) {
+    pub fn open(self, app: AppRef) {
         if let Some(existing) = self
             .windows
             .with(|ws| ws.iter().find(|w| w.app == app).map(|w| w.id))
@@ -183,7 +268,9 @@ impl Desktop {
             return;
         }
 
-        let (w, h) = app.default_size();
+        let manifest = self.manifest(app);
+        let w = f64::from(manifest.default_width.max(260));
+        let h = f64::from(manifest.default_height.max(150));
         let (vw, vh) = viewport();
         let step = self.windows.with(|ws| ws.len()) as f64;
         let x = (140.0 + step * CASCADE).min((vw - w - 24.0).max(16.0));
@@ -266,6 +353,7 @@ impl Desktop {
         wasm_bindgen_futures::spawn_local(async move {
             match crate::api::fetch_catalog().await {
                 Ok(catalog) => {
+                    self.catalog_error.set(None);
                     self.fs.set(catalog.fs);
                     if !catalog.wallpapers.is_empty() {
                         let current = self.wallpaper.get_untracked();
@@ -278,7 +366,10 @@ impl Desktop {
                         self.catalog.set(catalog.apps);
                     }
                 }
-                Err(err) => self.health.set(Some(Err(err))),
+                Err(err) => {
+                    self.catalog_error.set(Some(err.clone()));
+                    self.health.set(Some(Err(err)));
+                }
             }
 
             match crate::api::fetch_health().await {
@@ -290,10 +381,17 @@ impl Desktop {
 
     /// Human-readable backend status for the tray and panels.
     pub fn status_line(self) -> String {
+        // A dead backend is the more useful thing to say when both requests failed.
+        if let Some(Err(err)) = self.health.get() {
+            return format!("offline ({err})");
+        }
+        // Reachable, but the catalog was rejected: version skew, not a dead server.
+        if let Some(err) = self.catalog_error.get() {
+            return format!("catalog: {err}");
+        }
         match self.health.get() {
-            None => "connecting…".to_owned(),
             Some(Ok(h)) => format!("{} v{} · up {}s", h.name, h.version, h.uptime_secs),
-            Some(Err(e)) => format!("offline ({e})"),
+            _ => "connecting…".to_owned(),
         }
     }
 

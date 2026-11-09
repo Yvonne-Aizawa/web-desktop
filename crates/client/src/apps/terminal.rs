@@ -7,7 +7,6 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use leptos::prelude::*;
-use shared::AppId;
 use shared::fs::{EntryKind, PreviewBody};
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
@@ -119,7 +118,9 @@ pub fn Terminal() -> impl IntoView {
                 Line::out(
                     "built-in:   help  echo  open <app>  date  whoami  uname  neofetch  clear",
                 ),
-                Line::out("`open` takes an app slug: terminal, files, settings, about"),
+                Line::out(
+                    "`open` takes an app slug; try `open files` or anything the catalog lists",
+                ),
             ],
             "clear" => {
                 lines.set(Vec::new());
@@ -233,14 +234,9 @@ pub fn Terminal() -> impl IntoView {
                     Vec::new()
                 }
             }
-            "open" => match AppId::from_slug(&joined) {
-                Some(app) => {
-                    desktop.open(app);
-                    vec![Line::out(format!("launching {}...", app.name()))]
-                }
-                None => vec![Line::err(format!(
-                    "open: unknown app `{joined}` (try: terminal, files, settings, about)"
-                ))],
+            "open" => match desktop.open_slug(&joined) {
+                Ok(()) => vec![Line::out(format!("launching {joined}..."))],
+                Err(err) => vec![Line::err(format!("open: {err}"))],
             },
             other => vec![Line::err(format!("{other}: command not found"))],
         };

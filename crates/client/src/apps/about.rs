@@ -30,18 +30,18 @@ pub fn About() -> impl IntoView {
             <section class="pane">
                 <h3>"Launch"</h3>
                 <div class="launch-grid">
-                    <For each=move || desktop.catalog.get() key=|a| a.id let:app>
+                    <For each=move || desktop.catalog.get() key=|a| a.id.clone() let:app>
                         {
                             let accent = app.accent.clone();
                             let glyph = app.glyph.clone();
                             let name = app.name.clone();
                             let blurb = app.blurb.clone();
-                            let id = app.id;
+                            let target = app.clone();
                             view! {
                                 <button
                                     class="launch"
                                     style=move || format!("--accent:{accent};")
-                                    on:click=move |_| desktop.open(id)
+                                    on:click=move |_| desktop.open_manifest(&target)
                                 >
                                     <span class="launch-glyph">{glyph}</span>
                                     <span class="launch-meta">

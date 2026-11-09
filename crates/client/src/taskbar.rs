@@ -39,18 +39,25 @@ pub fn Taskbar() -> impl IntoView {
                 <For each=move || desktop.windows.get() key=|w| w.id let:item>
                     {
                         let live = desktop.live(item.id, item);
+                        // Labels come from the registry, not from geometry: the
+                        // chrome must not re-render just because a window moved.
+                        let manifest = desktop.manifest(item.app);
+                        let accent = manifest.accent.clone();
+                        let title_attr = manifest.name.clone();
+                        let title_label = manifest.name.clone();
+                        let glyph = manifest.glyph.clone();
                         let id = item.id;
                         view! {
                             <button
                                 class="task-btn"
                                 class:active=move || desktop.is_focused(id)
                                 class:minimized=move || live.get().minimized
-                                style=move || format!("--accent:{};", live.get().accent())
-                                title=move || live.get().title()
+                                style=move || format!("--accent:{accent};")
+                                title=title_attr
                                 on:click=move |_| desktop.toggle_minimize(id)
                             >
-                                <span class="task-glyph">{move || live.get().glyph()}</span>
-                                <span class="task-title">{move || live.get().title()}</span>
+                                <span class="task-glyph">{glyph}</span>
+                                <span class="task-title">{title_label}</span>
                             </button>
                         }
                     }

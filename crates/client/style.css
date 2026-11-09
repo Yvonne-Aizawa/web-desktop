@@ -741,6 +741,43 @@ button {
   color: #cdd6e4;
 }
 
+/* ---------- app not installed in this build ---------- */
+
+.unavailable {
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 24px;
+  text-align: center;
+}
+
+.unavailable-mark {
+  font-size: 34px;
+  line-height: 1;
+  opacity: 0.85;
+}
+
+.unavailable h3 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text);
+}
+
+.unavailable p {
+  margin: 0;
+  max-width: 44ch;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.unavailable-note {
+  color: #fbbf24;
+}
+
 /* ---------- settings + about ---------- */
 
 .settings,

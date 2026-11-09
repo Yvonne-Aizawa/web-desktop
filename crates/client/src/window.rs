@@ -19,7 +19,7 @@ use wasm_bindgen::JsCast;
 use web_sys::{Element, PointerEvent};
 
 use crate::apps::AppBody;
-use crate::state::{Desktop, WinData};
+use crate::state::{AppRef, Desktop, WinData};
 
 const MIN_W: f64 = 260.0;
 const MIN_H: f64 = 150.0;
@@ -123,19 +123,27 @@ fn release(ev: &PointerEvent) {
 }
 
 #[component]
-pub fn WindowFrame(id: u32, live: Memo<WinData>) -> impl IntoView {
+pub fn WindowFrame(id: u32, app: AppRef, live: Memo<WinData>) -> impl IntoView {
     let desktop = expect_context::<Desktop>();
+
+    // Resolved once, untracked: a window's app is fixed for its lifetime, so the
+    // chrome needs no reactive dependency on the registry or on geometry.
+    let manifest = desktop.manifest(app);
+    let accent = manifest.accent.clone();
+    let title = manifest.name.clone();
+    let glyph = manifest.glyph.clone();
 
     // (pointer id, pointer x, pointer y, window x, window y)
     let drag = RwSignal::new(None::<(i32, f64, f64, f64, f64)>);
     // (pointer id, edge, pointer x, pointer y, x, y, w, h)
     let grip = RwSignal::new(None::<(i32, Edge, f64, f64, f64, f64, f64, f64)>);
 
-    let style = move || live.get().css();
+    let frame_style = {
+        let accent = accent.clone();
+        move || live.get().css(&accent)
+    };
     let minimized = move || live.get().minimized;
     let maximized = move || live.get().maximized;
-    let title = move || live.get().title();
-    let glyph = move || live.get().glyph();
 
     let on_title_down = move |ev: PointerEvent| {
         if ev.button() != 0 {
@@ -227,7 +235,7 @@ pub fn WindowFrame(id: u32, live: Memo<WinData>) -> impl IntoView {
             class="window"
             class:minimized=minimized
             class:maximized=maximized
-            style=style
+            style=frame_style
             on:pointerdown=move |_| desktop.focus(id)
         >
             <header
@@ -270,7 +278,7 @@ pub fn WindowFrame(id: u32, live: Memo<WinData>) -> impl IntoView {
             </header>
 
             <div class="window-body">
-                <AppBody app=live.get().app />
+                <AppBody app=app />
             </div>
 
             <For each=move || EDGES key=|e| e.key() let:edge>

@@ -1,3 +1,8 @@
+[tools]
+# version_131 is the newest binaryen this trunk release knows about. Without this
+# pinned, trunk skips wasm-opt entirely.
+wasm_opt = "version_131"
+
 [build]
 target = "index.html"
 dist = "dist"

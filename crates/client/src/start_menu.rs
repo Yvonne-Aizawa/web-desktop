@@ -20,13 +20,13 @@ pub fn StartMenu() -> impl IntoView {
                 needle.is_empty()
                     || a.name.to_lowercase().contains(&needle)
                     || a.blurb.to_lowercase().contains(&needle)
-                    || a.id.slug().contains(&needle)
+                    || a.id.to_lowercase().contains(&needle)
             })
             .collect::<Vec<AppManifest>>()
     };
 
-    let open = move |id: shared::AppId| {
-        desktop.open(id);
+    let open = move |manifest: &AppManifest| {
+        desktop.open_manifest(manifest);
         desktop.start_open.set(false);
         query.set(String::new());
     };
@@ -61,18 +61,18 @@ pub fn StartMenu() -> impl IntoView {
                 </div>
 
                 <div class="menu-grid">
-                    <For each=filtered key=|a| a.id let:app>
+                    <For each=filtered key=|a| a.id.clone() let:app>
                         {
                             let accent = app.accent.clone();
                             let glyph = app.glyph.clone();
                             let name = app.name.clone();
                             let blurb = app.blurb.clone();
-                            let id = app.id;
+                            let target = app.clone();
                             view! {
                                 <button
                                     class="menu-item"
                                     style=move || format!("--accent:{accent};")
-                                    on:click=move |_| open(id)
+                                    on:click=move |_| open(&target)
                                 >
                                     <span class="menu-glyph">{glyph}</span>
                                     <span class="menu-meta">

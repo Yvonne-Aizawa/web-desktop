@@ -94,7 +94,7 @@ pub fn Settings() -> impl IntoView {
                     <p class="muted">
                         "Files are read on the server and fenced to that folder: `..`, absolute paths and links that leave it are refused."
                     </p>
-                    <button class="ghost-btn" on:click=move |_| desktop.open(AppId::Files)>
+                    <button class="ghost-btn" on:click=move |_| desktop.open_builtin(AppId::Files)>
                         "Open Files"
                     </button>
                 </Show>

@@ -89,9 +89,16 @@ impl AppId {
 }
 
 /// How the backend advertises an application to the frontend.
+///
+/// `id` is a plain slug rather than an [`AppId`] on purpose. The shell has to be
+/// able to *hold and display* an app it cannot run: if the server advertises an app
+/// from a newer build, decoding the id as a closed enum would fail and take the
+/// entire catalog down with it. Instead the entry survives, [`Self::builtin_id`]
+/// returns `None`, and the window says the app is not installed in this build.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppManifest {
-    pub id: AppId,
+    /// Stable slug, e.g. `terminal`. Matches [`AppId::slug`] for built-ins.
+    pub id: String,
     pub name: String,
     pub glyph: String,
     pub accent: String,
@@ -100,18 +107,51 @@ pub struct AppManifest {
     pub default_height: u32,
 }
 
-impl From<AppId> for AppManifest {
-    fn from(id: AppId) -> Self {
-        let (w, h) = id.default_size();
+impl AppManifest {
+    /// The catalog entry for a built-in app.
+    pub fn builtin(id: AppId) -> Self {
+        let (width, height) = id.default_size();
         Self {
-            id,
+            id: id.slug().to_owned(),
             name: id.name().to_owned(),
             glyph: id.glyph().to_owned(),
             accent: id.accent().to_owned(),
             blurb: id.blurb().to_owned(),
-            default_width: w as u32,
-            default_height: h as u32,
+            default_width: width as u32,
+            default_height: height as u32,
         }
+    }
+
+    /// Stands in for a window whose app handle is not in the shell's registry.
+    /// Unreachable through the public API, but a UI must not panic on it, and the
+    /// resulting "not installed" pane is the honest thing to show anyway.
+    pub fn placeholder() -> Self {
+        Self {
+            id: String::new(),
+            name: "Unknown app".to_owned(),
+            glyph: "?".to_owned(),
+            accent: "#97a1b4".to_owned(),
+            blurb: "No catalog entry".to_owned(),
+            default_width: 420,
+            default_height: 260,
+        }
+    }
+
+    /// The built-in this entry refers to, or `None` when the shell has no program
+    /// registered for this slug.
+    pub fn builtin_id(&self) -> Option<AppId> {
+        AppId::from_slug(&self.id)
+    }
+
+    /// Whether this build can actually run the app.
+    pub fn is_runnable(&self) -> bool {
+        self.builtin_id().is_some()
+    }
+}
+
+impl From<AppId> for AppManifest {
+    fn from(id: AppId) -> Self {
+        Self::builtin(id)
     }
 }
 
@@ -191,4 +231,65 @@ pub fn default_wallpapers() -> Vec<Wallpaper> {
         css: css.to_owned(),
     })
     .collect()
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    #[test]
+    fn an_unknown_app_does_not_break_the_catalog() {
+        // Exactly the skew case: a newer server advertising an app this build has
+        // never heard of. Decoding must succeed, with the entry kept intact.
+        // `r##` because the JSON contains `"#` in the accent colours.
+        let json = r##"{
+            "hostname": "web-desktop",
+            "apps": [
+                {"id":"terminal","name":"Terminal","glyph":">_","accent":"#4ade80",
+                 "blurb":"shell","default_width":680,"default_height":420},
+                {"id":"music","name":"Music","glyph":"\u266b","accent":"#f472b6",
+                 "blurb":"plays things","default_width":520,"default_height":360}
+            ],
+            "wallpapers": [],
+            "fs": {"enabled":false,"root":"","writable":false,"max_preview_bytes":0}
+        }"##;
+
+        let catalog: Catalog =
+            serde_json::from_str(json).expect("a catalog with an unknown app must still decode");
+        assert_eq!(catalog.apps.len(), 2);
+        assert_eq!(catalog.apps[0].builtin_id(), Some(AppId::Terminal));
+        assert!(catalog.apps[0].is_runnable());
+        assert_eq!(catalog.apps[1].id, "music");
+        assert_eq!(catalog.apps[1].builtin_id(), None);
+        assert!(!catalog.apps[1].is_runnable());
+        // Still displayable, which is the whole point of keeping it.
+        assert_eq!(catalog.apps[1].name, "Music");
+        assert_eq!(catalog.apps[1].accent, "#f472b6");
+    }
+
+    #[test]
+    fn a_manifest_id_is_wire_compatible_with_the_enum() {
+        // `AppId` serializes to a snake_case string and so does the slug, so
+        // turning the field into a `String` did not change the wire format.
+        let from_enum = serde_json::to_string(&AppId::Terminal).unwrap();
+        let from_manifest =
+            serde_json::to_string(&AppManifest::builtin(AppId::Terminal).id).unwrap();
+        assert_eq!(from_enum, from_manifest);
+        assert_eq!(from_enum, r#""terminal""#);
+    }
+
+    #[test]
+    fn placeholder_is_not_runnable() {
+        let placeholder = AppManifest::placeholder();
+        assert!(!placeholder.is_runnable());
+        assert_eq!(placeholder.builtin_id(), None);
+        assert_eq!(placeholder.name, "Unknown app");
+    }
+
+    #[test]
+    fn the_default_catalog_is_all_runnable() {
+        for app in default_catalog().apps {
+            assert!(app.is_runnable(), "{} should map to a built-in", app.id);
+        }
+    }
 }

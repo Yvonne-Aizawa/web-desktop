@@ -38,7 +38,7 @@ fn App() -> impl IntoView {
                 <For each=move || desktop.windows.get() key=|w| w.id let:item>
                     {
                         let live = desktop.live(item.id, item);
-                        view! { <WindowFrame id=item.id live=live /> }
+                        view! { <WindowFrame id=item.id app=item.app live=live /> }
                     }
                 </For>
 

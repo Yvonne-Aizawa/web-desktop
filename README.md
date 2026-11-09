@@ -184,6 +184,102 @@ binary).
 The frontend works without the backend: it boots from
 `shared::default_catalog()` and shows the backend as offline.
 
+## Adding a program
+
+A program is a compile-time variant, not a loaded module, so adding one is five
+edits and the compiler names every one of them:
+
+1. `crates/shared/src/lib.rs`: add an `AppId` variant, extend `AppId::ALL` (the
+   array *length* is part of the type), and fill in the six `const fn`s — `slug`,
+   `name`, `glyph`, `accent`, `blurb`, `default_size`.
+2. `crates/client/src/apps/<name>.rs`: an ordinary `#[component]`.
+3. `crates/client/src/apps/mod.rs`: `mod`/`pub use`, plus a match arm in `AppBody`.
+4. Rebuild. The server picks the app up from `AppManifest::from(AppId)`, which
+   `default_catalog()` derives from `AppId::ALL`.
+
+Adding a variant produces exactly seven errors — the six const fns and the
+`AppBody` arm — so a half-added app cannot compile, and no other file needs
+touching. Everything generic comes for free:
+
+| Wired up automatically | Because |
+| --- | --- |
+| Window, drag, 8 resize handles, z-order, minimize/maximize | `window.rs` only knows `WinData` |
+| Taskbar button, title, accent stripe | labels are resolved from the app registry |
+| Start-menu entry and search | the menu iterates `Desktop::catalog` |
+| About's launcher grid | same catalog |
+| `open <slug>` in the terminal | `Desktop::open_slug` |
+| The server's `/api/catalog` | `AppManifest::from(AppId)` |
+
+Two constraints are worth knowing before writing one:
+
+* **Per-app state lives in the component**, never in the window record. `WinData`
+  is `Copy` scalars on purpose (one signal for all windows is what makes a drag
+  repaint a single window), so an app owns its own signals — the terminal's
+  scrollback, the file browser's `cwd`. State therefore survives moves and resizes,
+  because a row is never remounted. Read geometry through the row's `Memo<WinData>`
+  and write it with `Desktop::edit`.
+* **One window per app.** `Desktop::open` dedupes on the app handle and raises the
+  existing window.
+
+## Groundwork for server-served apps
+
+The plan is for the server to hand out app *bundles* — a `manifest.json` plus a
+module the shell loads at runtime, with an SDK for writing them. Stage 0 is the
+part that does not need that machinery, and it is in place: the shell can already
+be handed a catalog it cannot fully run.
+
+**The catalog is data, the programs are code.** `AppManifest::id` is a slug
+(`String`), not an `AppId`. Before this, a server advertising one app from a newer
+build made `serde` reject the *whole* catalog: the desktop silently fell back to
+its four built-ins with no explanation, because a successful `/api/health` then
+overwrote the failed-catalog status. Now the entry survives, `builtin_id()` returns
+`None`, and opening it shows a pane that names the slug and says the shell and the
+server are out of step. A separate `catalog_error` signal means a failed catalog is
+reported instead of masked.
+
+**Windows hold an `AppRef`, not an app.** `AppRef` is a `u32` index into an
+append-only registry. That keeps `WinData` `Copy` — served apps will carry owned
+metadata (entry URL, hash), so the window record can only hold a handle — and
+because the registry is append-only and interned by slug, a catalog refresh can add
+or relabel apps without a window's handle silently pointing somewhere else.
+Labels, glyphs, accents and default sizes now come from the registry, so a server
+can rename or recolor an app the shell implements (verified: a 520x360 window in
+the catalog's accent colour).
+
+### What the shell costs
+
+Measured on this build, because it decides how much room the app tier has:
+
+| | before | now |
+| --- | --- | --- |
+| `client_bg.wasm` raw | 2,766,794 | 805,763 (wasm-opt `-Oz`) |
+| …over gzip | — | 284,965 |
+| …over brotli | — | 262,680 |
+| first load (wasm + js, brotli) | ~2.8 MB | **~264 KB** |
+
+wasm-opt needs *both* halves of the configuration: `[tools] wasm_opt = "version_131"`
+in `Trunk.toml` only pins which binaryen to use — trunk then skips the step unless a
+link asks for it, so `index.html` carries
+`<link data-trunk rel="rust" data-wasm-opt="z" />`. Compression is
+`CompressionLayer`, whose default predicate compresses everything except images
+(SVG excepted), gRPC, SSE and bodies under 32 bytes — so the image endpoint does not
+pay for it.
+
+### What stage 1 adds
+
+The ABI is a **mount contract at the JS boundary**, not a bespoke wasm import
+surface: `manifest.json` plus a module exporting `mount(el, host, props)` and
+`unmount(id)`. That keeps the loading path identical for Rust-wasm apps, plain JS
+apps and any future component-model app, and it avoids wasm-bindgen's `snippets/`
+plumbing for host-provided imports. The remaining work is a loader with a module
+cache, a `host` shim, the SDK crate, an `xtask build-app`, and ABI/version
+negotiation.
+
+The number to keep in mind: a minimal Leptos app is ~326 KB gzipped on its own, so
+a served app pays for its own copy of the framework. Per-app wasm is the right tier
+for optional and third-party apps; built-ins stay statically linked (all four cost
+~45 KB over the framework today).
+
 ## How the reactivity is arranged
 
 All window state is one root-owned `RwSignal<Vec<WinData>>`, where `WinData` is
@@ -224,6 +320,9 @@ That shape is load-bearing, so it is worth knowing why:
   button would describe a different directory than the list below them.
 - `/api/fs` returns JSON errors (`{"error": "..."}`) with real status codes, and a
   file used as a directory maps to 400 rather than leaking a 500.
+- The two bootstrap requests fail independently, so their status must not share one
+  slot: a healthy backend used to hide a rejected catalog entirely.
+- `Trunk.toml` alone does not enable wasm-opt — see the sizes section.
 - `trunk serve` writes its development build into the same `dist/` directory that
   the single-port server serves, so re-run `trunk build --release` before serving
   "production" again (the dev bundle is ~7x larger).
@@ -231,7 +330,9 @@ That shape is load-bearing, so it is worth knowing why:
 ## Not implemented
 
 Window layout is in memory only (no persistence, no backend sync), the file
-browser is read-only, and there is no client-side router. Natural next steps:
-persist geometry via `PUT /api/layout`, the write endpoints above, a WebSocket on
-a tokio `broadcast` channel to mirror windows across tabs, `leptos_router` for
-in-window routing, and real server-side thumbnailing with ETags.
+browser is read-only, there is no client-side router, and apps are still compiled
+in rather than served (see the stage 1 sketch above). Natural next steps: persist
+geometry via `PUT /api/layout`, the file write endpoints above, a WebSocket on a
+tokio `broadcast` channel to mirror windows across tabs, `leptos_router` for
+in-window routing, real server-side thumbnailing with ETags, and precompressed
+static assets so brotli is paid at build time rather than per request.
