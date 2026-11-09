@@ -709,6 +709,281 @@ button {
   color: #fbbf24;
 }
 
+/* ---------- text editor ---------- */
+
+/* `.app.editor` is the Text Editor's own root; Files' inline editor is
+   `.files-editor`, scoped under `.files`, so the two cannot restyle each other. */
+
+.editor-side {
+  width: 232px;
+  gap: 2px;
+}
+
+.editor-cwd {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 4px 4px;
+}
+
+.editor-cwd .ghost-btn {
+  padding: 2px 8px;
+  font-size: 12px;
+}
+
+.editor-path {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+}
+
+.editor-tree {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 2px 0;
+}
+
+.editor-node {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 4px 8px;
+  border-radius: 7px;
+  text-align: left;
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+.editor-node:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.editor-node.dir .editor-node-name {
+  font-weight: 600;
+}
+
+.editor-node.open {
+  background: rgba(52, 211, 153, 0.18);
+}
+
+.editor-node-icon {
+  flex: none;
+  font-size: 12px;
+}
+
+.editor-node-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.editor-hint {
+  border-top: 1px solid var(--stroke);
+  padding-top: 8px;
+}
+
+.editor-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.editor-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--stroke);
+}
+
+.editor-bar .ghost-btn {
+  flex: none;
+  padding: 5px 10px;
+  font-size: 11.5px;
+}
+
+.editor-notice {
+  font-size: 11.5px;
+  color: #86efac;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.editor-notice.error {
+  color: #ff9ea1;
+}
+
+.editor-tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 6px 8px 0;
+  border-bottom: 1px solid var(--stroke);
+  overflow-x: auto;
+  scrollbar-width: none;
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.editor-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.editor-tab {
+  display: flex;
+  align-items: center;
+  flex: none;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 8px 8px 0 0;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.editor-tab.active {
+  background: rgba(255, 255, 255, 0.09);
+  border-color: var(--stroke);
+}
+
+.editor-tab.dirty .tab-name::after {
+  content: "●";
+  margin-left: 6px;
+  color: #fbbf24;
+  font-size: 9px;
+  vertical-align: middle;
+}
+
+.editor-tab.unsupported .tab-name {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.tab-name {
+  padding: 6px 4px 6px 12px;
+  font-size: 12px;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.tab-close {
+  padding: 4px 9px 4px 6px;
+  font-size: 11px;
+  color: var(--muted);
+  border-radius: 6px;
+}
+
+.tab-close:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.tab-close.confirming {
+  color: #ffd7d8;
+  background: rgba(229, 72, 77, 0.3);
+  font-size: 10px;
+}
+
+.editor-tab-empty {
+  padding: 6px 8px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.editor-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 8px 10px;
+  gap: 6px;
+}
+
+.editor-sheet {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  border: 1px solid var(--stroke-strong);
+  border-radius: 9px;
+  overflow: hidden;
+  background: rgba(0, 0, 0, 0.32);
+}
+
+.editor-gutter {
+  flex: none;
+  padding: 10px 8px 10px 12px;
+  overflow: hidden;
+  text-align: right;
+  white-space: pre;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  color: rgba(151, 161, 180, 0.55);
+  background: rgba(255, 255, 255, 0.03);
+  border-right: 1px solid var(--stroke);
+  user-select: none;
+}
+
+.editor-textarea {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 0;
+  outline: none;
+  resize: none;
+  background: transparent;
+  color: #cdd6e4;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  tab-size: 4;
+  white-space: pre;
+  overflow: auto;
+}
+
+.editor-textarea[readonly] {
+  opacity: 0.8;
+}
+
+.editor-status {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 5px 12px;
+  border-top: 1px solid var(--stroke);
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.status-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+}
+
+.status-dirty {
+  color: #fbbf24;
+}
+
+.status-saved {
+  color: #86efac;
+}
+
 /* ---------- write affordances ---------- */
 
 .files-bar .ghost-btn {
@@ -764,7 +1039,7 @@ button {
 
 /* ---------- editor ---------- */
 
-.editor {
+.files-editor {
   display: flex;
   flex-direction: column;
   gap: 6px;

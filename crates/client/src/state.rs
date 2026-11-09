@@ -102,6 +102,11 @@ pub struct Desktop {
     /// What the backend is willing to expose to the Files app.
     pub fs: RwSignal<FsInfo>,
     pub start_open: RwSignal<bool>,
+    /// A file the Text Editor should open. Files sets it and raises the editor; the
+    /// editor consumes it. A one-shot handoff rather than shared state, so the two
+    /// apps stay independent: whoever is listening takes it, and a second request
+    /// simply replaces an unconsumed one.
+    pub pending_editor_file: RwSignal<Option<String>>,
     /// `None` while the first request is in flight, `Some(Err)` if it failed.
     pub health: RwSignal<Option<Result<Health, String>>>,
     /// Kept separate from [`Self::health`] on purpose: the two requests can fail
@@ -129,6 +134,7 @@ impl Desktop {
             wallpaper: RwSignal::new(initial_wallpaper()),
             fs: RwSignal::new(FsInfo::disabled()),
             start_open: RwSignal::new(false),
+            pending_editor_file: RwSignal::new(None),
             health: RwSignal::new(None),
             catalog_error: RwSignal::new(None),
             next_id: RwSignal::new(1),

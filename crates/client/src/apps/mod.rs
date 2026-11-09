@@ -8,11 +8,13 @@
 //! an explanatory pane rather than an error.
 
 mod about;
+mod editor;
 mod files;
 mod settings;
 mod terminal;
 
 pub use about::About;
+pub use editor::Editor;
 pub use files::Files;
 pub use settings::Settings;
 pub use terminal::Terminal;
@@ -35,6 +37,7 @@ pub fn AppBody(app: AppRef, window: u32) -> impl IntoView {
     match manifest.builtin_id() {
         Some(AppId::Terminal) => view! { <Terminal /> }.into_any(),
         Some(AppId::Files) => view! { <Files /> }.into_any(),
+        Some(AppId::Editor) => view! { <Editor /> }.into_any(),
         Some(AppId::Settings) => view! { <Settings /> }.into_any(),
         Some(AppId::About) => view! { <About /> }.into_any(),
         None if manifest.served().is_some() => {

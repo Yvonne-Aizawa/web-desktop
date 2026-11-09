@@ -27,18 +27,26 @@ pub const API_HEALTH: &str = "/api/health";
 pub enum AppId {
     Terminal,
     Files,
+    Editor,
     Settings,
     About,
 }
 
 impl AppId {
     /// Catalog order, also used by the client when the backend is unreachable.
-    pub const ALL: [AppId; 4] = [Self::Terminal, Self::Files, Self::Settings, Self::About];
+    pub const ALL: [AppId; 5] = [
+        Self::Terminal,
+        Self::Files,
+        Self::Editor,
+        Self::Settings,
+        Self::About,
+    ];
 
     pub const fn slug(self) -> &'static str {
         match self {
             Self::Terminal => "terminal",
             Self::Files => "files",
+            Self::Editor => "editor",
             Self::Settings => "settings",
             Self::About => "about",
         }
@@ -52,6 +60,7 @@ impl AppId {
         match self {
             Self::Terminal => "Terminal",
             Self::Files => "Files",
+            Self::Editor => "Text Editor",
             Self::Settings => "Settings",
             Self::About => "About",
         }
@@ -61,6 +70,7 @@ impl AppId {
         match self {
             Self::Terminal => ">_",
             Self::Files => "🗂",
+            Self::Editor => "✎",
             Self::Settings => "⚙",
             Self::About => "◍",
         }
@@ -70,6 +80,7 @@ impl AppId {
         match self {
             Self::Terminal => "#4ade80",
             Self::Files => "#60a5fa",
+            Self::Editor => "#34d399",
             Self::Settings => "#c084fc",
             Self::About => "#fbbf24",
         }
@@ -79,6 +90,7 @@ impl AppId {
         match self {
             Self::Terminal => "Shell with a handful of built-ins",
             Self::Files => "Browse the virtual filesystem",
+            Self::Editor => "Edit several files at once",
             Self::Settings => "Wallpaper, connectivity, layout",
             Self::About => "Build info and credits",
         }
@@ -89,6 +101,7 @@ impl AppId {
         match self {
             Self::Terminal => (680.0, 420.0),
             Self::Files => (760.0, 480.0),
+            Self::Editor => (940.0, 620.0),
             Self::Settings => (620.0, 460.0),
             Self::About => (460.0, 400.0),
         }

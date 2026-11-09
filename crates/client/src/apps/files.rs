@@ -768,6 +768,9 @@ fn preview_head(entry: FsEntry) -> AnyView {
     let rename_path = entry.path.clone();
     let rename_current = entry.name.clone();
     let delete_path = entry.path.clone();
+    let editor_path = entry.path.clone();
+    // Any regular file can be handed over; the editor decides whether it is text.
+    let editable_file = !entry.blocked && !is_dir && !entry.path.is_empty();
 
     let actions_visible = move || editable;
     let rename_visible = move || editable && !is_dir;
@@ -787,6 +790,18 @@ fn preview_head(entry: FsEntry) -> AnyView {
             >
                 "⭳ Download"
             </a>
+
+            <button
+                class="ghost-btn"
+                title="Open in the Text Editor"
+                style=move || if editable_file { "" } else { "display:none" }
+                on:click=move |_| {
+                    state.desktop.pending_editor_file.set(Some(editor_path.clone()));
+                    state.desktop.open_builtin(shared::AppId::Editor);
+                }
+            >
+                "✎ Edit"
+            </button>
 
             <div class="preview-actions" style=move || {
                 if actions_visible() { "" } else { "display:none" }
@@ -862,7 +877,7 @@ fn Editor(truncated: bool) -> impl IntoView {
     };
 
     view! {
-        <div class="editor">
+        <div class="files-editor">
             <div class="editor-bar">
                 <Show when=move || truncated>
                     <span class="preview-note">

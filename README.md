@@ -294,7 +294,7 @@ Measured on this build, because it decides how much room the app tier has:
 | `client_bg.wasm` raw | 2,766,794 | 805,763 (wasm-opt `-Oz`) |
 | …over gzip | — | 284,965 |
 | …over brotli | — | 262,680 |
-| first load (wasm + js, brotli) | ~2.8 MB | **~264 KB** |
+| first load (wasm + js, brotli) | ~2.8 MB | **~286 KB** |
 
 wasm-opt needs *both* halves of the configuration: `[tools] wasm_opt = "version_131"`
 in `Trunk.toml` only pins which binaryen to use — trunk then skips the step unless a
@@ -303,6 +303,29 @@ link asks for it, so `index.html` carries
 `CompressionLayer`, whose default predicate compresses everything except images
 (SVG excepted), gRPC, SSE and bodies under 32 bytes — so the image endpoint does not
 pay for it.
+
+### Text Editor
+
+`apps/editor.rs` is the third built-in that talks to the file API, and the most
+opinionated about DOM behaviour: several files open at once, one tab each with its own
+draft and dirty state, Save / Save all / Ctrl+S, a line-number gutter, a caret readout,
+and a close that asks before discarding.
+
+Two details are load-bearing:
+
+* **The textarea is uncontrolled.** Binding `value` reactively rewrites the box on
+  every keystroke, and browsers move the caret to the end when that happens. The box is
+  seeded once when a tab becomes active and edits flow one way, into the tab's draft.
+  The body renders from a `Memo` of `(path, name, kind)`, which does not change while
+  typing, so the element is never rebuilt under the caret.
+* **The tab bar reads live.** Learning this the hard way again: a keyed `For` row is not
+  re-rendered when its *item* changes, so dirty markers, the closing state and the
+  "unsupported" style all have to be read from the signal. Built from the row snapshot
+  they simply never update.
+
+Files that are not editable text still open — a tab that says whether it is binary or
+an image, with a download link — and a truncated file (>256 KiB) opens read-only,
+because saving it would drop the rest.
 
 ## Served apps
 
