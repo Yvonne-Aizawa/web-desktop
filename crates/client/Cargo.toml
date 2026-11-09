@@ -1,0 +1,40 @@
+[package]
+name = "client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+shared.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# `leptos` 0.8 has no default features: `csr` (client-side rendering) is what
+# turns on `reactive_graph/effects` and the client-side `view!` codegen.
+leptos = { version = "0.8", features = ["csr", "delegation"] }
+
+console_error_panic_hook = "0.1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+gloo-net = { version = "0.7", default-features = false, features = ["http", "json"] }
+gloo-timers = { version = "0.4", features = ["futures"] }
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlInputElement",
+    "Node",
+    "Event",
+    "EventTarget",
+    "MouseEvent",
+    "PointerEvent",
+    "KeyboardEvent",
+    "DomRect",
+    "CssStyleDeclaration",
+    "Location",
+]

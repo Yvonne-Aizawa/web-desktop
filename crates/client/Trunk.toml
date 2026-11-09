@@ -1,0 +1,18 @@
+[build]
+target = "index.html"
+dist = "dist"
+filehash = false
+
+[watch]
+watch = ["index.html", "style.css", "src", "../shared/src"]
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 8081
+open = false
+
+# Forward API calls to the axum backend while developing. `rewrite` scopes the
+# proxy to /api (without it Trunk forwards every request, including /).
+[[proxy]]
+backend = "http://127.0.0.1:8080/api"
+rewrite = "/api"
