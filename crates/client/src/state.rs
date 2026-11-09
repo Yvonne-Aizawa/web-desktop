@@ -362,8 +362,10 @@ impl Desktop {
                     self.catalog_error.set(None);
                     self.fs.set(catalog.fs);
                     if !catalog.wallpapers.is_empty() {
-                        let current = self.wallpaper.get_untracked();
-                        if !catalog.wallpapers.iter().any(|w| w.css == current) {
+                        // Only fill in a default; never replace what is already set.
+                        // The Gallery can set a wallpaper from a photo, which is a
+                        // `url(...)` that no catalog entry will ever match.
+                        if self.wallpaper.get_untracked().is_empty() {
                             self.wallpaper.set(catalog.wallpapers[0].css.clone());
                         }
                         self.wallpapers.set(catalog.wallpapers);

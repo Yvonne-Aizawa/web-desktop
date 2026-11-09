@@ -28,16 +28,18 @@ pub enum AppId {
     Terminal,
     Files,
     Editor,
+    Gallery,
     Settings,
     About,
 }
 
 impl AppId {
     /// Catalog order, also used by the client when the backend is unreachable.
-    pub const ALL: [AppId; 5] = [
+    pub const ALL: [AppId; 6] = [
         Self::Terminal,
         Self::Files,
         Self::Editor,
+        Self::Gallery,
         Self::Settings,
         Self::About,
     ];
@@ -47,6 +49,7 @@ impl AppId {
             Self::Terminal => "terminal",
             Self::Files => "files",
             Self::Editor => "editor",
+            Self::Gallery => "gallery",
             Self::Settings => "settings",
             Self::About => "about",
         }
@@ -61,6 +64,7 @@ impl AppId {
             Self::Terminal => "Terminal",
             Self::Files => "Files",
             Self::Editor => "Text Editor",
+            Self::Gallery => "Gallery",
             Self::Settings => "Settings",
             Self::About => "About",
         }
@@ -71,6 +75,7 @@ impl AppId {
             Self::Terminal => ">_",
             Self::Files => "🗂",
             Self::Editor => "✎",
+            Self::Gallery => "🖼",
             Self::Settings => "⚙",
             Self::About => "◍",
         }
@@ -81,6 +86,7 @@ impl AppId {
             Self::Terminal => "#4ade80",
             Self::Files => "#60a5fa",
             Self::Editor => "#34d399",
+            Self::Gallery => "#f472b6",
             Self::Settings => "#c084fc",
             Self::About => "#fbbf24",
         }
@@ -91,6 +97,7 @@ impl AppId {
             Self::Terminal => "Shell with a handful of built-ins",
             Self::Files => "Browse the virtual filesystem",
             Self::Editor => "Edit several files at once",
+            Self::Gallery => "Look at the photos in your files",
             Self::Settings => "Wallpaper, connectivity, layout",
             Self::About => "Build info and credits",
         }
@@ -102,6 +109,7 @@ impl AppId {
             Self::Terminal => (680.0, 420.0),
             Self::Files => (760.0, 480.0),
             Self::Editor => (940.0, 620.0),
+            Self::Gallery => (900.0, 640.0),
             Self::Settings => (620.0, 460.0),
             Self::About => (460.0, 400.0),
         }

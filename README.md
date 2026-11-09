@@ -334,6 +334,23 @@ Files that are not editable text still open — a tab that says whether it is bi
 an image, with a download link — and a truncated file (>256 KiB) opens read-only,
 because saving it would drop the rest.
 
+### Gallery
+
+`apps/gallery.rs` shows the photos in a folder as a contact sheet, with a viewer that
+steps through them (arrow keys, Escape) and reports each one's pixel size, byte size and
+date. Folders are tiles too, so it doubles as a browser; hidden files are a toggle.
+
+Nothing about it is photo-specific on the server: it lists a folder, filters to the
+formats `shared::fs::image_mime` says the browser can decode, and points tiles at
+`/api/fs/raw`. Files that *look* like images but are in a format no browser decodes
+(TIFF, HEIC, PSD) are counted and mentioned rather than shown as broken tiles, and a tile
+whose bytes fail to decode marks itself "unreadable" instead of leaving a broken icon.
+
+One shell interaction: **Set as wallpaper** puts the photo behind the whole desktop. The
+wallpaper is a CSS `background` value, so `url('/api/fs/raw?path=…')` is as valid as a
+gradient — which is also why the catalog refresh no longer replaces a wallpaper it does
+not recognise (it used to, and would have wiped the photo on the next reconnect).
+
 ## Served apps
 
 The alternative to compiling a program in: the server hands over a bundle and the
