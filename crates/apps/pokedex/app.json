@@ -1,0 +1,10 @@
+{
+  "id": "pokedex",
+  "name": "Pokédex",
+  "glyph": "⚡",
+  "accent": "#facc15",
+  "blurb": "A random Pokémon, fetched through the proxy",
+  "default_width": 460,
+  "default_height": 600,
+  "version": "0.1.0"
+}

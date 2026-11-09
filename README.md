@@ -397,6 +397,28 @@ either: POST and other methods (the shape is one `enum Request`, so widening it 
 deliberate), per-host secret headers, and any caching. Settings shows whether the proxy is
 on and for which hosts.
 
+### Sample apps
+
+Two apps live in the repository, built with `cargo xtask build-app`:
+
+| App | Shows |
+| --- | --- |
+| `crates/apps/calculator` | A four-function calculator: signals, the host object, its own styles. |
+| `crates/apps/pokedex` | A random Pokémon from <https://pokeapi.co>: the proxy, and the SDK's `fetch`. |
+
+The Pokédex is the one that exercises the network, and it needs the proxy to be told
+about the host:
+
+```bash
+WEB_DESKTOP_PROXY_HOSTS=pokeapi.co cargo run -p server --release
+```
+
+It is a good illustration of the two halves of the rule: **reading** a response needs
+permission, so the JSON goes through `/api/proxy`, while the **sprite** is an `<img>` —
+an image needs no CORS at all, so it loads straight from the sprite CDN. With the proxy
+off, the app says so and names the variable to set, because the proxy's refusals carry
+the reason.
+
 ### How one app opens another's file
 
 `Desktop::request_open(app, path)` puts an `OpenRequest` in a one-shot slot and raises
