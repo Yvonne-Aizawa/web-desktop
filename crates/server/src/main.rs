@@ -13,6 +13,11 @@
 //!   WEB_DESKTOP_ADDR  listen address, default 127.0.0.1:8080
 //!   WEB_DESKTOP_ROOT  directory the file browser may read, default ~/web-desktop
 //!   WEB_DESKTOP_FS    set to `off` to disable the filesystem API entirely
+//!   WEB_DESKTOP_FS_WRITE
+//!                     `on`/`off` for the write endpoints. Default: on for the
+//!                     sandbox this server creates itself, off for a root chosen
+//!                     with WEB_DESKTOP_ROOT, so pointing it at real work stays
+//!                     read-only until you say otherwise.
 //!   WEB_DESKTOP_DIST  path to the built client bundle
 //!   WEB_DESKTOP_APPS  directory of served app bundles, default ./apps
 
@@ -82,7 +87,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fs_root = match init_fs() {
         Ok(Some(root)) => {
             catalog.fs = root.info(true);
-            tracing::info!("file browser root: {} (read-only)", catalog.fs.root);
+            tracing::info!(
+                "file browser root: {} ({})",
+                catalog.fs.root,
+                if catalog.fs.writable {
+                    "read-write"
+                } else {
+                    "read-only"
+                }
+            );
             Some(root)
         }
         Ok(None) => {
@@ -186,6 +199,11 @@ async fn catalog_handler(State(state): State<Arc<AppState>>) -> Json<Catalog> {
 }
 
 /// Set up the sandboxed root: `WEB_DESKTOP_ROOT`, else `~/web-desktop`.
+///
+/// Whether it is writable depends on where it came from. A directory the server
+/// created for this purpose is fair game; one the operator pointed at is not, until
+/// they opt in — and either way the frontend is told which, so it can explain rather
+/// than fail on save.
 fn init_fs() -> Result<Option<FsRoot>, String> {
     let disabled = std::env::var("WEB_DESKTOP_FS")
         .map(|v| {
@@ -199,12 +217,25 @@ fn init_fs() -> Result<Option<FsRoot>, String> {
         return Ok(None);
     }
 
-    let path = match std::env::var_os("WEB_DESKTOP_ROOT") {
-        Some(dir) => PathBuf::from(dir),
-        None => home_dir().join("web-desktop"),
+    let (path, chosen_root) = match std::env::var_os("WEB_DESKTOP_ROOT") {
+        Some(dir) => (PathBuf::from(dir), true),
+        None => (home_dir().join("web-desktop"), false),
     };
 
-    let (root, created) = FsRoot::new(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let requested = std::env::var("WEB_DESKTOP_FS_WRITE").ok().map(|v| {
+        matches!(
+            v.to_ascii_lowercase().as_str(),
+            "on" | "1" | "true" | "yes" | "enabled"
+        )
+    });
+    let writable = requested.unwrap_or(!chosen_root);
+    let readonly_reason = (!writable).then(|| match requested {
+        Some(_) => "editing is switched off on this server (WEB_DESKTOP_FS_WRITE=off)".to_owned(),
+        None => "this root was chosen with WEB_DESKTOP_ROOT, so it is read-only until you start the server with WEB_DESKTOP_FS_WRITE=on".to_owned(),
+    });
+
+    let (root, created) = FsRoot::new(&path, writable, readonly_reason)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     if created {
         tracing::info!("created sandbox at {}", root.root().display());
         if let Err(err) = seed(root.root()) {
@@ -222,9 +253,12 @@ fn seed(root: &std::path::Path) -> std::io::Result<()> {
     std::fs::write(
         root.join("README.txt"),
         "This folder is the sandbox for the web desktop's Files app.\n\n\
-         The backend serves it read-only over /api/fs/*; nothing outside this\n\
-         directory is reachable. Delete these sample files whenever you like.\n\n\
-         Point the API somewhere else with WEB_DESKTOP_ROOT=/some/path.\n",
+         The backend serves it over /api/fs/*, fenced to this directory: nothing\n\
+         outside it is reachable, and links that point out are refused. Because\n\
+         this sandbox was created for the purpose, it is read-write; a root you\n\
+         point at yourself with WEB_DESKTOP_ROOT stays read-only until you start\n\
+         the server with WEB_DESKTOP_FS_WRITE=on.\n\n\
+         Delete these sample files whenever you like.\n",
     )?;
     std::fs::write(
         notes.join("todo.md"),

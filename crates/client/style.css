@@ -675,11 +675,152 @@ button {
   white-space: nowrap;
 }
 
-.preview-head .ghost-btn {
-  margin-left: auto;
+.preview-head .ghost-btn,
+.preview-actions .ghost-btn {
   padding: 4px 10px;
   font-size: 11.5px;
   text-decoration: none;
+}
+
+.preview-head > .ghost-btn:first-of-type {
+  margin-left: auto;
+}
+
+.preview-actions {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.preview-head .ghost-btn.primary,
+.editor-bar .ghost-btn.primary {
+  border-color: rgba(96, 165, 250, 0.55);
+  background: rgba(96, 165, 250, 0.16);
+}
+
+.preview-head .ghost-btn.danger.confirming,
+.editor-bar .ghost-btn.danger.confirming {
+  color: #ffd7d8;
+  background: rgba(229, 72, 77, 0.28);
+  border-color: rgba(229, 72, 77, 0.7);
+}
+
+.side-readonly {
+  color: #fbbf24;
+}
+
+/* ---------- write affordances ---------- */
+
+.files-bar .ghost-btn {
+  flex: none;
+  padding: 5px 9px;
+  font-size: 11.5px;
+}
+
+.files-prompt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--stroke);
+  background: rgba(96, 165, 250, 0.08);
+}
+
+.prompt-label {
+  font-size: 11.5px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.prompt-input {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 9px;
+  border-radius: 7px;
+  border: 1px solid var(--stroke-strong);
+  background: rgba(0, 0, 0, 0.3);
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  outline: none;
+}
+
+.prompt-input:focus {
+  border-color: rgba(96, 165, 250, 0.6);
+}
+
+.files-notice {
+  padding: 6px 12px;
+  font-size: 11.5px;
+  color: #86efac;
+  background: rgba(74, 222, 128, 0.1);
+  border-bottom: 1px solid var(--stroke);
+  cursor: pointer;
+}
+
+.files-notice.error {
+  color: #ff9ea1;
+  background: rgba(229, 72, 77, 0.12);
+}
+
+/* ---------- editor ---------- */
+
+.editor {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 0;
+  flex: 1;
+}
+
+.editor-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.editor-bar .ghost-btn {
+  padding: 4px 10px;
+  font-size: 11.5px;
+}
+
+.editor-spacer {
+  flex: 1;
+}
+
+.editor-dirty {
+  font-size: 11.5px;
+  color: #fbbf24;
+}
+
+.editor-box {
+  flex: 1;
+  min-height: 160px;
+  resize: vertical;
+  padding: 10px 12px;
+  border-radius: 9px;
+  border: 1px solid var(--stroke-strong);
+  background: rgba(0, 0, 0, 0.32);
+  color: #cdd6e4;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  tab-size: 4;
+  outline: none;
+}
+
+.editor-box:focus {
+  border-color: rgba(96, 165, 250, 0.55);
+}
+
+.editor-box[readonly] {
+  opacity: 0.75;
+  cursor: default;
+}
+
+.files-preview {
+  flex: 1;
+  min-height: 0;
+  display: flex;
 }
 
 .preview-note {

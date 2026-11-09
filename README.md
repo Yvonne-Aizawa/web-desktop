@@ -63,6 +63,10 @@ browser's own filesystem sandbox and nothing reaches outside that root.
 | `GET /api/fs/preview?path=` | A text body (capped at 256 KiB), an image marker, or a binary notice with a guessed MIME type |
 | `GET /api/fs/raw?path=` | Image bytes, inline, for an `<img src>` |
 | `GET /api/fs/download?path=` | The raw bytes, capped at 64 MiB, as an attachment |
+| `PUT /api/fs/content?path=` | Write the body as the file's contents (text save or binary upload, atomically) |
+| `POST /api/fs/dir` | Create a directory |
+| `PATCH /api/fs/entry` | Rename an entry within its folder |
+| `DELETE /api/fs/entry?path=` | Delete a file, or a directory with `&recursive=true` |
 
 ### Image previews
 
@@ -139,19 +143,39 @@ The `/api/fs` routes also reject requests whose `Sec-Fetch-Site` is `cross-site`
 Reads were never readable cross-origin (no CORS headers) but they did still
 execute, and that matters as soon as writes exist.
 
-### Adding writes
+### Editing
 
-Writes are deliberately not implemented. The shape is ready for them:
+The Files app edits, creates, renames, uploads and deletes. Every mutation goes
+through the same fence as the reads, and writes are gated on configuration first:
 
-* `shared::FsInfo` advertises `writable: false`, so the frontend hides mutation UI
-  rather than probing for it.
-* `same_origin` is applied as router middleware to everything under `/api/fs`.
-* `FsRoot::resolve_parent` is the fence for paths that do not exist yet, which is
-  the piece creation needs (a missing path cannot be canonicalized; its parent can).
+| Setting | Effect |
+| --- | --- |
+| *(default)* | The sandbox at `~/web-desktop` is read-write |
+| `WEB_DESKTOP_ROOT=/somewhere` | That root is **read-only** until you also set `WEB_DESKTOP_FS_WRITE=on` |
+| `WEB_DESKTOP_FS_WRITE=on` / `off` | Force either way |
 
-The endpoints to add would be `POST /api/fs/dir`, `PATCH /api/fs/entry`,
-`DELETE /api/fs/entry` and `PUT /api/fs/file`, all going through the same two
-functions.
+`shared::FsInfo` carries `writable` and a `readonly_reason`, so the frontend hides
+its write affordances and shows *why* rather than offering a button that fails.
+
+What the write path is careful about:
+
+* **Creation resolves the parent.** A path that does not exist cannot be
+  canonicalized, so `FsRoot::resolve_parent` proves the parent is inside the root and
+  appends one validated component. Names are checked for separators, `.`/`..`, NULs
+  and length before anything is touched.
+* **Saves are atomic.** Content is written to a temporary file in the same directory
+  and renamed over the target, so a failure halfway cannot leave a half-written file.
+* **Deletes ask twice.** A non-empty directory needs `recursive=true`; the UI turns
+  the Delete button into a confirmation that names what is about to go. The root
+  itself cannot be deleted or renamed.
+* **Read-only is enforced server-side, not in the UI.** Every handler checks it
+  before looking at the request.
+* **Cross-site writes were already blocked** by the `same_origin` middleware, which
+  is why reads never needed it but a write path does.
+
+Still open here: no trash or undo (a delete is a delete), no optimistic locking, so
+two windows editing one file last-write-wins, and no PDF or binary in-place editing
+— those are uploads.
 
 ## Quick start
 
@@ -184,8 +208,12 @@ cargo xtask precompress apps                  # if the browser is to get it comp
 Point the file browser at something other than the default sandbox:
 
 ```bash
-WEB_DESKTOP_ROOT=~/Documents cargo run -p server
+WEB_DESKTOP_ROOT=~/Documents cargo run -p server          # read-only
+WEB_DESKTOP_ROOT=~/Documents WEB_DESKTOP_FS_WRITE=on cargo run -p server
 ```
+
+A root you choose is read-only unless you add the second variable. The sidebar says
+so and explains how to change it, rather than offering buttons that would fail.
 
 Requires the `wasm32-unknown-unknown` target (`rustup target add
 wasm32-unknown-unknown`) and `trunk` (`cargo install trunk`, or grab a release
@@ -422,9 +450,17 @@ That shape is load-bearing, so it is worth knowing why:
 
 ## Not implemented
 
-Window layout is in memory only (no persistence, no backend sync), the file
-browser is read-only and there is no client-side router. Natural next steps: persist
-geometry via `PUT /api/layout`, the file write endpoints above, a WebSocket on a
-tokio `broadcast` channel to mirror windows across tabs, `leptos_router` for
-in-window routing, real server-side thumbnailing with ETags, and precompressed
-static assets so brotli is paid at build time rather than per request.
+* **No trash or undo.** A delete is a delete, and an overwrite is an overwrite.
+* **No optimistic locking.** Two windows editing one file is last-write-wins; the
+  editor does not notice that the file changed underneath it.
+* **No cross-folder move.** Rename stays in the same directory, since the listing
+  has no drag and drop.
+* **No permissions or ownership UI.** Files are created with the server user's
+  umask, and a replaced file takes the new default mode rather than keeping the old.
+* **Window layout is in memory only** (no persistence, no backend sync), and there
+  is no client-side router.
+
+Natural next steps: persist layout with `PUT /api/layout`, detect external edits by
+comparing mtime before saving, a WebSocket on a tokio `broadcast` channel to mirror
+windows across tabs, `leptos_router` for in-window routing, and server-side
+thumbnailing with ETags.

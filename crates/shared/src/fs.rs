@@ -20,6 +20,17 @@ pub const API_FS_RAW: &str = "/api/fs/raw";
 /// `GET` with `?path=<relative>` -> raw bytes with `Content-Disposition`.
 pub const API_FS_DOWNLOAD: &str = "/api/fs/download";
 
+/// `PUT` with `?path=<relative>`: write the request body as the file's contents.
+/// Creates the file if it does not exist, replaces it if it does, and is the same
+/// endpoint for a text save and a binary upload — the body is opaque bytes.
+pub const API_FS_CONTENT: &str = "/api/fs/content";
+/// `POST` with `{"path": <dir>, "name": <name>}`: create a directory.
+pub const API_FS_DIR: &str = "/api/fs/dir";
+/// `PATCH` with `{"path": <entry>, "name": <new name>}`: rename within its folder.
+pub const API_FS_ENTRY: &str = "/api/fs/entry";
+/// `DELETE` with `?path=<entry>[&recursive=true]`: delete a file or a directory.
+pub const API_FS_DELETE: &str = "/api/fs/entry";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryKind {
@@ -62,6 +73,15 @@ pub struct DirListing {
 pub struct FilePreview {
     pub entry: FsEntry,
     pub body: PreviewBody,
+}
+
+/// Request body for [`API_FS_DIR`] and [`API_FS_ENTRY`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsMutation {
+    /// Root-relative path of the folder (for `dir`) or the entry (for `entry`).
+    pub path: String,
+    /// The new name, without separators.
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,10 +168,18 @@ pub struct FsInfo {
     pub enabled: bool,
     /// Absolute path of the sandbox root, for display in Settings.
     pub root: String,
-    /// Always `false` today. The write endpoints are not implemented; this flag
-    /// exists so the frontend can hide mutation UI instead of probing for it.
+    /// Whether the write endpoints will accept anything. The frontend hides its
+    /// editing affordances when this is false rather than failing on save.
     pub writable: bool,
+    /// Why writes are off, when they are: shown to the user instead of a silent
+    /// read-only pane.
+    #[serde(default)]
+    pub readonly_reason: Option<String>,
     pub max_preview_bytes: u64,
+    /// Largest body [`API_FS_CONTENT`] will accept, so the editor can refuse before
+    /// uploading something the server would reject.
+    #[serde(default)]
+    pub max_write_bytes: u64,
 }
 
 impl FsInfo {
@@ -162,8 +190,15 @@ impl FsInfo {
             enabled: false,
             root: String::new(),
             writable: false,
+            readonly_reason: Some("the file browser is switched off on the server".to_owned()),
             max_preview_bytes: 0,
+            max_write_bytes: 0,
         }
+    }
+
+    /// Whether the frontend should offer editing at all.
+    pub fn can_write(&self) -> bool {
+        self.enabled && self.writable
     }
 }
 
@@ -175,7 +210,32 @@ pub struct ApiError {
 
 #[cfg(test)]
 mod tests {
-    use super::{image_mime, looks_like_image};
+    use super::{FsInfo, image_mime, looks_like_image};
+
+    #[test]
+    fn can_write_needs_both_flags() {
+        let mut info = FsInfo {
+            enabled: true,
+            root: "/tmp".to_owned(),
+            writable: true,
+            readonly_reason: None,
+            max_preview_bytes: 1,
+            max_write_bytes: 1,
+        };
+        assert!(info.can_write());
+        info.writable = false;
+        assert!(!info.can_write());
+        info.writable = true;
+        info.enabled = false;
+        assert!(!info.can_write());
+    }
+
+    #[test]
+    fn a_disabled_file_browser_explains_itself() {
+        let info = FsInfo::disabled();
+        assert!(!info.can_write());
+        assert!(info.readonly_reason.is_some());
+    }
 
     #[test]
     fn known_image_formats() {

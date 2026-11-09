@@ -40,4 +40,9 @@ features = [
     "CssStyleDeclaration",
     "Location",
     "HtmlDivElement",
+    "HtmlTextAreaElement",
+    # the upload picker
+    "File",
+    "FileList",
+    "Blob",
 ]

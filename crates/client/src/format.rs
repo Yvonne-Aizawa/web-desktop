@@ -30,6 +30,18 @@ pub fn format_millis(millis: i64) -> String {
     )
 }
 
+/// Like [`format_millis`] but without the year, for the narrow column in a listing.
+pub fn format_short_millis(millis: i64) -> String {
+    let date = js_sys::Date::new(&JsValue::from_f64(millis as f64));
+    format!(
+        "{:02}-{:02} {:02}:{:02}",
+        date.get_month() + 1,
+        date.get_date(),
+        date.get_hours(),
+        date.get_minutes()
+    )
+}
+
 /// Percent-encode a value for use in a query string.
 ///
 /// Deliberately encodes `/` as well: paths travel as a single query *value*, and

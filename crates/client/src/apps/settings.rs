@@ -78,8 +78,15 @@ pub fn Settings() -> impl IntoView {
                     }
                 >
                     <div class="kv">
-                        <span>"status"</span>
-                        <span class="badge badge-wait">"read-only"</span>
+                        <span>"access"</span>
+                        <Show
+                            when=move || desktop.fs.get().writable
+                            fallback=move || {
+                                view! { <span class="badge badge-wait">"read-only"</span> }
+                            }
+                        >
+                            <span class="badge badge-ok">"read-write"</span>
+                        </Show>
                     </div>
                     <div class="kv">
                         <span>"root"</span>
@@ -92,8 +99,20 @@ pub fn Settings() -> impl IntoView {
                         <span>{move || human_size(desktop.fs.get().max_preview_bytes)}</span>
                     </div>
                     <p class="muted">
-                        "Files are read on the server and fenced to that folder: `..`, absolute paths and links that leave it are refused."
+                        "Everything happens on the server, fenced to that folder: `..`, absolute paths and links that leave it are refused. Saves are atomic, and deletes ask first."
                     </p>
+                    <Show when=move || !desktop.fs.get().writable>
+                        <p class="muted">
+                            {move || {
+                                desktop
+                                    .fs
+                                    .get()
+                                    .readonly_reason
+                                    .clone()
+                                    .unwrap_or_default()
+                            }}
+                        </p>
+                    </Show>
                     <button class="ghost-btn" on:click=move |_| desktop.open_builtin(AppId::Files)>
                         "Open Files"
                     </button>

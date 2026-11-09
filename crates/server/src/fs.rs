@@ -33,17 +33,19 @@ use std::{
 
 use axum::{
     Json, Router,
-    body::Body,
+    body::{Body, Bytes},
+    extract::DefaultBodyLimit,
     extract::{Query, Request, State},
     http::{HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, patch, post, put},
 };
 use serde::Deserialize;
 use shared::fs::{
-    API_FS_DOWNLOAD, API_FS_LIST, API_FS_PREVIEW, API_FS_RAW, ApiError, DirListing, EntryKind,
-    FilePreview, FsEntry, FsInfo, PreviewBody, image_mime,
+    API_FS_CONTENT, API_FS_DELETE, API_FS_DIR, API_FS_DOWNLOAD, API_FS_ENTRY, API_FS_LIST,
+    API_FS_PREVIEW, API_FS_RAW, ApiError, DirListing, EntryKind, FilePreview, FsEntry, FsInfo,
+    FsMutation, PreviewBody, image_mime,
 };
 use tokio_util::io::ReaderStream;
 
@@ -68,6 +70,13 @@ pub fn router() -> Router<Arc<AppState>> {
         .route(API_FS_PREVIEW, get(preview))
         .route(API_FS_RAW, get(raw))
         .route(API_FS_DOWNLOAD, get(download))
+        // Writes. The body limit has to be raised or axum refuses anything over 2 MB
+        // before the handler sees it.
+        .route(API_FS_CONTENT, put(write_content))
+        .route(API_FS_DIR, post(create_dir))
+        .route(API_FS_ENTRY, patch(rename_entry))
+        .route(API_FS_DELETE, axum::routing::delete(delete_entry))
+        .layer(DefaultBodyLimit::max(MAX_FILE_BYTES as usize))
         .route_layer(middleware::from_fn(same_origin))
 }
 
@@ -96,26 +105,54 @@ async fn same_origin(req: Request, next: Next) -> Result<Response, FsError> {
 #[derive(Debug)]
 pub struct FsRoot {
     root: PathBuf,
+    /// Whether the mutation endpoints are allowed to do anything.
+    writable: bool,
+    /// Why not, when they are not.
+    readonly_reason: Option<String>,
 }
 
 impl FsRoot {
     /// Create the directory if needed and canonicalize it, so every later
     /// comparison is made between two canonical paths.
-    pub fn new(path: &Path) -> std::io::Result<(Self, bool)> {
+    pub fn new(
+        path: &Path,
+        writable: bool,
+        readonly_reason: Option<String>,
+    ) -> std::io::Result<(Self, bool)> {
         let created = !path.exists();
         std::fs::create_dir_all(path)?;
         let root = path.canonicalize()?;
-        Ok((Self { root }, created))
+        Ok((
+            Self {
+                root,
+                writable,
+                readonly_reason,
+            },
+            created,
+        ))
     }
 
     pub fn info(&self, enabled: bool) -> FsInfo {
         FsInfo {
             enabled,
             root: self.root.to_string_lossy().into_owned(),
-            // No write endpoint exists yet; see the module docs.
-            writable: false,
+            writable: self.writable,
+            readonly_reason: self.readonly_reason.clone(),
             max_preview_bytes: MAX_PREVIEW_BYTES,
+            max_write_bytes: MAX_FILE_BYTES,
         }
+    }
+
+    /// Refuse a mutation when the server was not asked to allow them.
+    fn writable(&self) -> Result<(), FsError> {
+        if self.writable {
+            return Ok(());
+        }
+        Err(FsError::Denied(
+            self.readonly_reason
+                .clone()
+                .unwrap_or_else(|| "this file browser is read-only".to_owned()),
+        ))
     }
 
     pub fn root(&self) -> &Path {
@@ -137,10 +174,9 @@ impl FsRoot {
         self.contained(canonical, &rel)
     }
 
-    /// Same fence, for a path that does not exist yet: canonicalize the parent
-    /// and append the final component. Unused by the read API; here so the write
-    /// endpoints have one obvious place to start.
-    #[allow(dead_code)]
+    /// Same fence, for a path that does not exist yet: canonicalize the parent and
+    /// append the final component. Creation cannot canonicalize the leaf, so the
+    /// parent is the part that has to be proved to be inside the root.
     pub fn resolve_parent(&self, rel: &str) -> Result<PathBuf, FsError> {
         let rel = normalise(rel)?;
         let (parent, name) = match rel.rsplit_once('/') {
@@ -176,6 +212,29 @@ impl FsRoot {
             .collect::<Vec<_>>()
             .join("/")
     }
+}
+
+/// A single path component supplied by the client: a name to create, or a new name
+/// to rename to. Rejects everything that could redirect the operation.
+fn entry_name(name: &str) -> Result<&str, FsError> {
+    let trimmed = name.trim();
+    let invalid = |why: &str| FsError::BadRequest(format!("invalid name: {why}"));
+    if trimmed.is_empty() {
+        return Err(invalid("it is empty"));
+    }
+    if trimmed == "." || trimmed == ".." {
+        return Err(invalid("`.` and `..` are not names"));
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return Err(invalid("it contains a path separator"));
+    }
+    if trimmed.contains('\0') {
+        return Err(invalid("it contains a NUL byte"));
+    }
+    if trimmed.chars().count() > 255 {
+        return Err(invalid("it is longer than 255 characters"));
+    }
+    Ok(trimmed)
 }
 
 /// Clean a client path and reject the shapes that should never be accepted even
@@ -217,6 +276,15 @@ pub struct PathQuery {
 pub struct DownloadQuery {
     #[serde(default)]
     pub path: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeleteQuery {
+    #[serde(default)]
+    pub path: String,
+    /// Required to remove a directory that still has something in it.
+    #[serde(default)]
+    pub recursive: bool,
 }
 
 async fn list(
@@ -476,6 +544,196 @@ async fn raw(
     Ok(response)
 }
 
+// ------------------------------------------------------------------- writes
+//
+// Every one of these goes through the same fence as the reads, and every one is
+// gated on `FsRoot::writable` first, so a read-only server refuses before it looks
+// at the request at all.
+
+/// Write the request body as a file's contents.
+///
+/// Creates the file when it does not exist, replaces it when it does, and does not
+/// care whether the bytes are text or binary: the editor and the uploader use the
+/// same endpoint. The write is atomic (temp file, then rename in the same
+/// directory), so a failure halfway cannot leave a truncated file behind.
+async fn write_content(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<DownloadQuery>,
+    body: Bytes,
+) -> Result<Json<FsEntry>, FsError> {
+    let root = state.fs.as_ref().ok_or_else(FsError::fs_disabled)?;
+    root.writable()?;
+
+    if body.len() as u64 > MAX_FILE_BYTES {
+        return Err(FsError::TooLarge(format!(
+            "body is {} bytes; the limit is {MAX_FILE_BYTES}",
+            body.len()
+        )));
+    }
+
+    let path = root.resolve_parent(&q.path)?;
+
+    // Replacing a directory, or a link that points outside the root, is not a write.
+    match tokio::fs::symlink_metadata(&path).await {
+        Ok(meta) if meta.is_dir() => {
+            return Err(FsError::BadRequest(format!("`{}` is a directory", q.path)));
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(FsError::from_io(&err, &q.path)),
+    }
+
+    write_atomic(&path, &body)
+        .await
+        .map_err(|e| FsError::from_io(&e, &q.path))?;
+
+    let meta = tokio::fs::metadata(&path)
+        .await
+        .map_err(|e| FsError::from_io(&e, &q.path))?;
+    Ok(Json(entry_for(root, &path, &meta)))
+}
+
+/// Create a directory.
+async fn create_dir(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<FsMutation>,
+) -> Result<Json<FsEntry>, FsError> {
+    let root = state.fs.as_ref().ok_or_else(FsError::fs_disabled)?;
+    root.writable()?;
+
+    let name = entry_name(&request.name)?;
+    let parent = root.resolve(&request.path)?;
+    let target = parent.join(name);
+
+    // Creation must not be a way to follow a link out of the root, and must not
+    // silently adopt an existing entry.
+    if tokio::fs::symlink_metadata(&target).await.is_ok() {
+        return Err(FsError::Conflict(format!("`{name}` already exists")));
+    }
+
+    tokio::fs::create_dir(&target)
+        .await
+        .map_err(|e| FsError::from_io(&e, &format!("{}/{name}", request.path)))?;
+
+    let meta = tokio::fs::symlink_metadata(&target)
+        .await
+        .map_err(|e| FsError::from_io(&e, &request.path))?;
+    Ok(Json(entry_for(root, &target, &meta)))
+}
+
+/// Rename an entry within its own folder.
+async fn rename_entry(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<FsMutation>,
+) -> Result<Json<FsEntry>, FsError> {
+    let root = state.fs.as_ref().ok_or_else(FsError::fs_disabled)?;
+    root.writable()?;
+
+    let name = entry_name(&request.name)?;
+    if request.path.is_empty() {
+        return Err(FsError::BadRequest("cannot rename the root".to_owned()));
+    }
+
+    let source = root.resolve(&request.path)?;
+    if source == root.root() {
+        return Err(FsError::Denied("cannot rename the root".to_owned()));
+    }
+    let target = root.resolve_parent(&match request.path.rsplit_once('/') {
+        Some((parent, _)) => format!("{parent}/{name}"),
+        None => name.to_owned(),
+    })?;
+
+    if target == source {
+        let meta = tokio::fs::symlink_metadata(&source)
+            .await
+            .map_err(|e| FsError::from_io(&e, &request.path))?;
+        return Ok(Json(entry_for(root, &source, &meta)));
+    }
+    if tokio::fs::symlink_metadata(&target).await.is_ok() {
+        return Err(FsError::Conflict(format!("`{name}` already exists")));
+    }
+
+    tokio::fs::rename(&source, &target)
+        .await
+        .map_err(|e| FsError::from_io(&e, &request.path))?;
+
+    let meta = tokio::fs::symlink_metadata(&target)
+        .await
+        .map_err(|e| FsError::from_io(&e, &request.path))?;
+    Ok(Json(entry_for(root, &target, &meta)))
+}
+
+/// Delete a file, or a directory when `recursive=true`.
+async fn delete_entry(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<DeleteQuery>,
+) -> Result<StatusCode, FsError> {
+    let root = state.fs.as_ref().ok_or_else(FsError::fs_disabled)?;
+    root.writable()?;
+
+    if q.path.is_empty() {
+        return Err(FsError::Denied("cannot delete the root".to_owned()));
+    }
+    let target = root.resolve(&q.path)?;
+    if target == root.root() {
+        return Err(FsError::Denied("cannot delete the root".to_owned()));
+    }
+
+    let meta = tokio::fs::symlink_metadata(&target)
+        .await
+        .map_err(|e| FsError::from_io(&e, &q.path))?;
+
+    if meta.is_dir() {
+        if !q.recursive {
+            let mut entries = tokio::fs::read_dir(&target)
+                .await
+                .map_err(|e| FsError::from_io(&e, &q.path))?;
+            if entries
+                .next_entry()
+                .await
+                .map_err(|e| FsError::from_io(&e, &q.path))?
+                .is_some()
+            {
+                return Err(FsError::Conflict(format!("`{}` is not empty", q.path)));
+            }
+        }
+        tokio::fs::remove_dir_all(&target)
+            .await
+            .map_err(|e| FsError::from_io(&e, &q.path))?;
+    } else {
+        tokio::fs::remove_file(&target)
+            .await
+            .map_err(|e| FsError::from_io(&e, &q.path))?;
+    }
+
+    tracing::info!("fs: deleted {}", q.path);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Replace a file's contents without ever leaving it half-written.
+async fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let directory = path.parent().unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_owned());
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let temporary = directory.join(format!(".{name}.tmp{stamp}"));
+
+    if let Err(err) = tokio::fs::write(&temporary, bytes).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(err);
+    }
+    if let Err(err) = tokio::fs::rename(&temporary, path).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(err);
+    }
+    Ok(())
+}
+
 /// Resolve a path, require a regular file, and refuse anything over the cap.
 async fn open_file(
     state: &Arc<AppState>,
@@ -603,6 +861,7 @@ fn guess_mime(path: &Path) -> String {
 pub enum FsError {
     BadRequest(String),
     Denied(String),
+    Conflict(String),
     NotFound(String),
     TooLarge(String),
     ServiceUnavailable(String),
@@ -638,6 +897,7 @@ impl FsError {
         match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Denied(_) => StatusCode::FORBIDDEN,
+            Self::Conflict(_) => StatusCode::CONFLICT,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -649,6 +909,7 @@ impl FsError {
         match self {
             Self::BadRequest(m)
             | Self::Denied(m)
+            | Self::Conflict(m)
             | Self::NotFound(m)
             | Self::TooLarge(m)
             | Self::ServiceUnavailable(m)
