@@ -9,16 +9,26 @@
 //! it loads straight from the sprite CDN. Only *reading* a response needs permission.
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use app_sdk::prelude::*;
 use leptos::task::spawn_local;
 use serde::Deserialize;
 
-/// `GET /api/v2/pokemon?limit=1` — just for the current total, so we do not roll an id
-/// the API does not have yet.
+/// `GET /api/v2/pokemon` — the list of everything the API will answer for.
+///
+/// Rolling an id against `count` does not work: the count includes forms that are not
+/// addressable (`/pokemon/1026/` is a 404), so a quarter of rolls would come back empty.
+/// The list carries the url for each entry, which always resolves.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 struct Index {
-    count: u32,
+    results: Vec<Entry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct Entry {
+    name: String,
+    url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -124,12 +134,19 @@ enum State {
     Failed(String),
 }
 
-async fn roll() -> Result<Pokemon, String> {
-    let index: Index = app_sdk::fetch::json("https://pokeapi.co/api/v2/pokemon?limit=1").await?;
-    // `Math::random` is the browser's own randomness; no dependency needed for one die.
-    let span = f64::from(index.count.saturating_sub(1)).max(1.0);
-    let id = 1 + (js_sys::Math::random() * span) as u32;
-    app_sdk::fetch::json(&format!("https://pokeapi.co/api/v2/pokemon/{id}")).await
+async fn index() -> Result<Vec<Entry>, String> {
+    let index: Index =
+        app_sdk::fetch::json("https://pokeapi.co/api/v2/pokemon?limit=100000").await?;
+    Ok(index.results)
+}
+
+/// Fetch one entry, retrying once: the proxy makes an upstream hiccup look like a
+/// failed roll, and there is nothing to lose by asking again.
+async fn fetch_pokemon(url: &str) -> Result<Pokemon, String> {
+    match app_sdk::fetch::json(url).await {
+        Ok(pokemon) => Ok(pokemon),
+        Err(first) => app_sdk::fetch::json(url).await.map_err(|_| first),
+    }
 }
 
 const STYLES: &str = "
@@ -145,8 +162,11 @@ const STYLES: &str = "
 .poke-meta { display: flex; gap: 18px; font-family: ui-monospace, monospace; font-size: 12px; }
 .poke-stats { display: grid; grid-template-columns: auto 1fr auto; gap: 5px 10px; width: 100%;
               max-width: 320px; align-items: center; font-size: 11.5px; }
-.poke-stat-bar { height: 6px; border-radius: 3px; background: rgba(255,255,255,.12); overflow: hidden; }
-.poke-stat-fill { height: 100%; border-radius: 3px; }
+.poke-stat-bar { display: block; height: 6px; border-radius: 3px;
+                 background: rgba(255,255,255,.12); overflow: hidden; }
+/* `display: block` matters: the fill is a span, and an inline box ignores width and
+   height, so the bars render empty however sensible the inline style looks. */
+.poke-stat-fill { display: block; height: 100%; border-radius: 3px; }
 .poke-stat-name { text-transform: uppercase; letter-spacing: .06em; opacity: .7; font-size: 10px; }
 .poke-foot { margin-top: auto; display: flex; gap: 8px; align-items: center; }
 .poke-btn { padding: 9px 16px; border-radius: 10px; border: 1px solid; font-size: 12.5px;
@@ -162,11 +182,39 @@ app_sdk::app! {
         let state = RwSignal::new(State::Loading);
         let ctx_roll = ctx.clone();
 
+        // The list of names is fetched once per window and kept, so a roll costs one
+        // request instead of two.
+        // `Arc`, not `Rc`: a signal's value has to be `Send + Sync`.
+        let names = RwSignal::new(None::<Arc<Vec<Entry>>>);
+
         let roll: Rc<dyn Fn()> = Rc::new(move || {
             state.set(State::Loading);
             let ctx = ctx_roll.clone();
+            let cached = names.get_untracked();
             spawn_local(async move {
-                match roll().await {
+                let entries = match cached {
+                    Some(entries) => Ok(entries),
+                    None => match index().await {
+                        Ok(entries) => {
+                            let entries = Arc::new(entries);
+                            names.set(Some(Arc::clone(&entries)));
+                            Ok(entries)
+                        }
+                        Err(err) => Err(err),
+                    },
+                };
+                let outcome = match entries {
+                    Ok(entries) if !entries.is_empty() => {
+                        // `Math::random` is the browser's own randomness: no dependency
+                        // needed for one die.
+                        let pick =
+                            (js_sys::Math::random() * entries.len() as f64) as usize % entries.len();
+                        fetch_pokemon(&entries[pick].url).await
+                    }
+                    Ok(_) => Err("the API returned no Pokémon".to_owned()),
+                    Err(err) => Err(err),
+                };
+                match outcome {
                     Ok(pokemon) => {
                         ctx.log(&format!("rolled {}", pokemon.name));
                         state.set(State::Ready(Box::new(pokemon)));
