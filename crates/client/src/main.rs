@@ -9,6 +9,7 @@
 
 mod api;
 mod apps;
+mod format;
 mod start_menu;
 mod state;
 mod taskbar;

@@ -18,7 +18,7 @@
 //! and owned by the row, so a drag repaints exactly one window.
 
 use leptos::prelude::*;
-use shared::{AppId, AppManifest, Health, Wallpaper, default_catalog};
+use shared::{AppId, AppManifest, Health, Wallpaper, default_catalog, fs::FsInfo};
 
 /// Height of the taskbar in CSS pixels; the window area excludes it.
 pub const TASKBAR_HEIGHT: f64 = 52.0;
@@ -98,6 +98,8 @@ pub struct Desktop {
     pub catalog: RwSignal<Vec<AppManifest>>,
     pub wallpapers: RwSignal<Vec<Wallpaper>>,
     pub wallpaper: RwSignal<String>,
+    /// What the backend is willing to expose to the Files app.
+    pub fs: RwSignal<FsInfo>,
     pub start_open: RwSignal<bool>,
     /// `None` while the first request is in flight, `Some(Err)` if it failed.
     pub health: RwSignal<Option<Result<Health, String>>>,
@@ -119,6 +121,7 @@ impl Desktop {
             catalog: RwSignal::new(fallback.apps),
             wallpapers: RwSignal::new(fallback.wallpapers),
             wallpaper: RwSignal::new(initial_wallpaper()),
+            fs: RwSignal::new(FsInfo::disabled()),
             start_open: RwSignal::new(false),
             health: RwSignal::new(None),
             next_id: RwSignal::new(1),
@@ -263,6 +266,7 @@ impl Desktop {
         wasm_bindgen_futures::spawn_local(async move {
             match crate::api::fetch_catalog().await {
                 Ok(catalog) => {
+                    self.fs.set(catalog.fs);
                     if !catalog.wallpapers.is_empty() {
                         let current = self.wallpaper.get_untracked();
                         if !catalog.wallpapers.iter().any(|w| w.css == current) {

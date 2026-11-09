@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod fs;
+
 /// Endpoint returning [`Catalog`].
 pub const API_CATALOG: &str = "/api/catalog";
 /// Endpoint returning [`Health`].
@@ -127,6 +129,7 @@ pub struct Catalog {
     pub hostname: String,
     pub apps: Vec<AppManifest>,
     pub wallpapers: Vec<Wallpaper>,
+    pub fs: fs::FsInfo,
 }
 
 /// Liveness payload for the About/Settings panels.
@@ -144,6 +147,7 @@ pub fn default_catalog() -> Catalog {
         hostname: "web-desktop".to_owned(),
         apps: AppId::ALL.into_iter().map(AppManifest::from).collect(),
         wallpapers: default_wallpapers(),
+        fs: fs::FsInfo::disabled(),
     }
 }
 

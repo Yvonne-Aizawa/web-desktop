@@ -7,6 +7,8 @@ wire types are defined once.
 Draggable and resizable windows with 8 resize handles, z-order focus, double-click
 to maximize, a taskbar with per-window buttons, a start menu with search, six
 wallpapers, a clock, and four built-in apps (Terminal, Files, Settings, About).
+The Files app browses a **real folder on the machine running the backend**, fenced
+inside a single sandbox directory and read-only.
 
 ```
 crates/
@@ -46,6 +48,59 @@ Alternatives if you outgrow these: `yew`/`dioxus` instead of `leptos`, `actix-we
 instead of `axum`, `wgpu`/`egui` instead of DOM widgets, `leptos_axum` server
 functions if you want to skip the hand-written JSON layer.
 
+## The file browser
+
+The Files app is a view of one directory on the server. Nothing runs in the
+browser's own filesystem sandbox and nothing reaches outside that root.
+
+| Endpoint | Returns |
+| --- | --- |
+| `GET /api/fs/list?path=` | [`DirListing`](crates/shared/src/fs.rs): entries, kinds, sizes, mtimes |
+| `GET /api/fs/preview?path=` | Text (capped at 256 KiB) or a binary notice with a guessed MIME type |
+| `GET /api/fs/download?path=` | The raw bytes, capped at 64 MiB, as an attachment |
+
+Paths on the wire are always root-relative and `/`-separated, with `""` meaning
+the root, so an absolute path never appears in a request.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `WEB_DESKTOP_ROOT` | `~/web-desktop` | The only directory the API will read |
+| `WEB_DESKTOP_FS` | on | `off` disables the API; the app then says so |
+
+The sandbox is created on first run with a few sample files (a README, `notes/`,
+and one dotfile) and is safe to empty out or delete.
+
+### What the fence does
+
+`FsRoot::resolve` is the only place client input becomes a filesystem path. It
+rejects `..` and NUL outright, then **canonicalizes** the joined path and requires
+it to still be inside the root. Because canonicalization resolves symlinks, a link
+pointing at `/etc` fails the same check as `../../etc`, and it is listed with a
+`blocked` flag so the UI can explain itself instead of offering a dead end.
+
+Verified against: `..`, `../../etc/passwd`, `testdir/../../etc/passwd`,
+percent-encoded and double-encoded traversal, absolute paths, `..%00`, a symlink
+to `/etc`, a path *through* that symlink, and the same tricks against preview and
+download. All fail closed.
+
+The `/api/fs` routes also reject requests whose `Sec-Fetch-Site` is `cross-site`.
+Reads were never readable cross-origin (no CORS headers) but they did still
+execute, and that matters as soon as writes exist.
+
+### Adding writes
+
+Writes are deliberately not implemented. The shape is ready for them:
+
+* `shared::FsInfo` advertises `writable: false`, so the frontend hides mutation UI
+  rather than probing for it.
+* `same_origin` is applied as router middleware to everything under `/api/fs`.
+* `FsRoot::resolve_parent` is the fence for paths that do not exist yet, which is
+  the piece creation needs (a missing path cannot be canonicalized; its parent can).
+
+The endpoints to add would be `POST /api/fs/dir`, `PATCH /api/fs/entry`,
+`DELETE /api/fs/entry` and `PUT /api/fs/file`, all going through the same two
+functions.
+
 ## Quick start
 
 Two terminals, hot reload on the frontend:
@@ -65,6 +120,12 @@ Single port (what you would deploy):
 ```bash
 cd crates/client && trunk build --release
 cd ../.. && cargo run -p server --release     # serves crates/client/dist on :8080
+```
+
+Point the file browser at something other than the default sandbox:
+
+```bash
+WEB_DESKTOP_ROOT=~/Documents cargo run -p server
 ```
 
 Requires the `wasm32-unknown-unknown` target (`rustup target add
@@ -109,14 +170,19 @@ That shape is load-bearing, so it is worth knowing why:
   so plain `ServeDir` is enough.
 - Trunk's `[[proxy]]` forwards *every* path unless you add `rewrite`, so the config
   here uses `backend = ".../api"` + `rewrite = "/api"`.
+- The server canonicalizes paths, so a folder opened *through* a symlink reports
+  its real location. The Files app adopts that path, otherwise its path bar and Up
+  button would describe a different directory than the list below them.
+- `/api/fs` returns JSON errors (`{"error": "..."}`) with real status codes, and a
+  file used as a directory maps to 400 rather than leaking a 500.
 - `trunk serve` writes its development build into the same `dist/` directory that
   the single-port server serves, so re-run `trunk build --release` before serving
   "production" again (the dev bundle is ~7x larger).
 
 ## Not implemented
 
-Window layout is in memory only (no persistence, no backend sync), the Files app
-is a read-only fake filesystem, and there is no client-side router. Natural next
-steps: persist geometry via `PUT /api/layout`, a WebSocket on a tokio `broadcast`
-channel to mirror windows across tabs, `leptos_router` for in-window routing, and
-`wasm-opt` tuning for bundle size.
+Window layout is in memory only (no persistence, no backend sync), the file
+browser is read-only, and there is no client-side router. Natural next steps:
+persist geometry via `PUT /api/layout`, the write endpoints above, a WebSocket on
+a tokio `broadcast` channel to mirror windows across tabs, `leptos_router` for
+in-window routing, and image thumbnails in the preview pane.

@@ -1,7 +1,9 @@
 //! Settings: wallpaper picker, backend status, layout actions.
 
 use leptos::prelude::*;
+use shared::AppId;
 
+use crate::format::human_size;
 use crate::state::Desktop;
 
 #[component]
@@ -57,6 +59,45 @@ pub fn Settings() -> impl IntoView {
                     "The desktop boots from `shared::default_catalog()` and refreshes from `/api/catalog`."
                 </p>
                 <button class="ghost-btn" on:click=move |_| desktop.refresh()>"Reconnect"</button>
+            </section>
+
+            <section class="pane">
+                <h3>"File browser"</h3>
+                <Show
+                    when=move || desktop.fs.get().enabled
+                    fallback=move || {
+                        view! {
+                            <div class="kv">
+                                <span>"status"</span>
+                                <span class="badge badge-bad">"disabled"</span>
+                            </div>
+                            <p class="muted">
+                                "The server rejected or was not given a root. Start it with WEB_DESKTOP_ROOT=/some/folder, and make sure WEB_DESKTOP_FS is not `off`."
+                            </p>
+                        }
+                    }
+                >
+                    <div class="kv">
+                        <span>"status"</span>
+                        <span class="badge badge-wait">"read-only"</span>
+                    </div>
+                    <div class="kv">
+                        <span>"root"</span>
+                        <span class="path-value" title=move || desktop.fs.get().root>
+                            {move || desktop.fs.get().root.clone()}
+                        </span>
+                    </div>
+                    <div class="kv">
+                        <span>"preview limit"</span>
+                        <span>{move || human_size(desktop.fs.get().max_preview_bytes)}</span>
+                    </div>
+                    <p class="muted">
+                        "Files are read on the server and fenced to that folder: `..`, absolute paths and links that leave it are refused."
+                    </p>
+                    <button class="ghost-btn" on:click=move |_| desktop.open(AppId::Files)>
+                        "Open Files"
+                    </button>
+                </Show>
             </section>
 
             <section class="pane">

@@ -1,11 +1,21 @@
 //! Minimal axum backend for the web desktop.
 //!
-//! Two jobs:
+//! Three jobs:
 //!   1. Serve the JSON API defined in the `shared` crate.
-//!   2. In single-port mode, serve the `trunk` output directory (`client/dist`).
+//!   2. Serve the `trunk` output directory (`client/dist`) in single-port mode.
+//!   3. Expose one directory on this machine to the Files app, fenced inside a
+//!      single root (see [`fs`]).
 //!
 //! During development you normally run `trunk serve` (port 8081) with its proxy
 //! pointed here (port 8080) and let trunk own the frontend.
+//!
+//! Configuration:
+//!   WEB_DESKTOP_ADDR  listen address, default 127.0.0.1:8080
+//!   WEB_DESKTOP_ROOT  directory the file browser may read, default ~/web-desktop
+//!   WEB_DESKTOP_FS    set to `off` to disable the filesystem API entirely
+//!   WEB_DESKTOP_DIST  path to the built client bundle
+
+mod fs;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
 
@@ -14,10 +24,14 @@ use shared::{API_CATALOG, API_HEALTH, Catalog, Health, default_catalog};
 use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
+use crate::fs::FsRoot;
+
 #[derive(Debug)]
-struct AppState {
+pub struct AppState {
     started: Instant,
     catalog: Catalog,
+    /// `None` when the filesystem API is switched off or its root is unusable.
+    fs: Option<FsRoot>,
 }
 
 #[tokio::main]
@@ -31,17 +45,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let addr: SocketAddr = std::env::var("WEB_DESKTOP_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:8080".to_owned())
+        .unwrap_or_else(|_| "127.0.0.1:8080".to_owned())
         .parse()?;
+
+    let mut catalog = default_catalog();
+    let fs_root = match init_fs() {
+        Ok(Some(root)) => {
+            catalog.fs = root.info(true);
+            tracing::info!("file browser root: {} (read-only)", catalog.fs.root);
+            Some(root)
+        }
+        Ok(None) => {
+            tracing::info!("file browser disabled by WEB_DESKTOP_FS");
+            None
+        }
+        Err(err) => {
+            tracing::error!("file browser disabled: {err}");
+            None
+        }
+    };
 
     let state = Arc::new(AppState {
         started: Instant::now(),
-        catalog: default_catalog(),
+        catalog,
+        fs: fs_root,
     });
 
     let api = Router::new()
         .route(API_HEALTH, get(health))
-        .route(API_CATALOG, get(catalog))
+        .route(API_CATALOG, get(catalog_handler))
+        .merge(fs::router())
         .with_state(state.clone());
 
     let dist = resolve_dist();
@@ -83,8 +116,73 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Health> {
     })
 }
 
-async fn catalog(State(state): State<Arc<AppState>>) -> Json<Catalog> {
+async fn catalog_handler(State(state): State<Arc<AppState>>) -> Json<Catalog> {
     Json(state.catalog.clone())
+}
+
+/// Set up the sandboxed root: `WEB_DESKTOP_ROOT`, else `~/web-desktop`.
+fn init_fs() -> Result<Option<FsRoot>, String> {
+    let disabled = std::env::var("WEB_DESKTOP_FS")
+        .map(|v| {
+            matches!(
+                v.to_ascii_lowercase().as_str(),
+                "off" | "0" | "false" | "disabled"
+            )
+        })
+        .unwrap_or(false);
+    if disabled {
+        return Ok(None);
+    }
+
+    let path = match std::env::var_os("WEB_DESKTOP_ROOT") {
+        Some(dir) => PathBuf::from(dir),
+        None => home_dir().join("web-desktop"),
+    };
+
+    let (root, created) = FsRoot::new(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if created {
+        tracing::info!("created sandbox at {}", root.root().display());
+        if let Err(err) = seed(root.root()) {
+            tracing::warn!("could not write sample files: {err}");
+        }
+    }
+    Ok(Some(root))
+}
+
+/// Fill a brand new sandbox with a few files, so the first run shows something
+/// instead of an empty folder. Only ever called when we created the directory.
+fn seed(root: &std::path::Path) -> std::io::Result<()> {
+    let notes = root.join("notes");
+    std::fs::create_dir_all(&notes)?;
+    std::fs::write(
+        root.join("README.txt"),
+        "This folder is the sandbox for the web desktop's Files app.\n\n\
+         The backend serves it read-only over /api/fs/*; nothing outside this\n\
+         directory is reachable. Delete these sample files whenever you like.\n\n\
+         Point the API somewhere else with WEB_DESKTOP_ROOT=/some/path.\n",
+    )?;
+    std::fs::write(
+        notes.join("todo.md"),
+        "# todo\n\n- [x] window manager\n- [x] real file browser\n- [ ] write support\n",
+    )?;
+    std::fs::write(
+        notes.join("scratch.rs"),
+        "fn main() {\n    println!(\"hello from the sandbox\");\n}\n",
+    )?;
+    std::fs::write(
+        root.join(".hidden-example"),
+        "dotfiles are hidden by default\n",
+    )?;
+    Ok(())
+}
+
+fn home_dir() -> PathBuf {
+    // `std::env::home_dir` is deprecated; HOME covers the platforms this targets.
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Find the trunk output dir, accepting a few working directories so that
