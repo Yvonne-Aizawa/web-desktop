@@ -211,6 +211,30 @@ cargo xtask build-app crates/apps/calculator  # stages apps/calculator/<version>
 cargo xtask precompress apps                  # if the browser is to get it compressed
 ```
 
+### Configuration
+
+The server reads its settings from the environment, and loads a `.env` file first if
+there is one — searched for in the working directory and its parents, so a `.env` at the
+repository root is found wherever you run from. **A value already in your shell wins over
+the file**, and only the path is logged, never the values, because a `.env` may hold an
+API key. `.env` is gitignored; `.env.example` lists every variable with a note.
+
+```bash
+cp .env.example .env      # then edit
+```
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `WEB_DESKTOP_ADDR` | `127.0.0.1:8080` | Listen address |
+| `WEB_DESKTOP_ROOT` | `~/web-desktop` | The one directory the file browser may touch |
+| `WEB_DESKTOP_FS` | on | `off` disables the file API |
+| `WEB_DESKTOP_FS_WRITE` | on for the sandbox, off for a chosen root | `on`/`off` for editing |
+| `WEB_DESKTOP_PROXY_HOSTS` | empty (off) | Hosts the outbound proxy may reach |
+| `WEB_DESKTOP_PROXY_ALLOW_PRIVATE` | off | Also allow private and loopback addresses |
+| `WEB_DESKTOP_APPS` | `apps` | Where built app bundles live |
+| `WEB_DESKTOP_DIST` | `crates/client/dist` | Where the client bundle is served from |
+| `RUST_LOG` | `server=info` | Log filter |
+
 Point the file browser at something other than the default sandbox:
 
 ```bash

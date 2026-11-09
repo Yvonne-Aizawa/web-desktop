@@ -6,6 +6,9 @@ license.workspace = true
 
 [dependencies]
 shared.workspace = true
+# `.env` support: the shell reads its configuration from the environment, and this
+# lets a file provide it without exporting anything.
+dotenvy = "0.15"
 
 serde.workspace = true
 serde_json.workspace = true

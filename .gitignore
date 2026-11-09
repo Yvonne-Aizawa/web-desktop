@@ -3,3 +3,6 @@
 **/dist
 .trunk
 /apps
+
+# local configuration, and it may hold an API key
+.env

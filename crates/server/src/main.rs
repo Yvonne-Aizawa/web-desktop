@@ -9,7 +9,12 @@
 //! During development you normally run `trunk serve` (port 8081) with its proxy
 //! pointed here (port 8080) and let trunk own the frontend.
 //!
-//! Configuration:
+//! Configuration is read from the environment, and a `.env` file is loaded first if
+//! there is one, so nothing has to be exported by hand. Values already in the
+//! environment win over the file, and the file is searched for in the working
+//! directory and its parents (so running from the workspace root finds the same one
+//! `cargo run` does).
+//!
 //!   WEB_DESKTOP_ADDR  listen address, default 127.0.0.1:8080
 //!   WEB_DESKTOP_ROOT  directory the file browser may read, default ~/web-desktop
 //!   WEB_DESKTOP_FS    set to `off` to disable the filesystem API entirely
@@ -62,6 +67,13 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Before anything reads the environment. Only the path is logged: a `.env` may
+    // hold an API key.
+    match dotenvy::dotenv() {
+        Ok(path) => println!("configuration: loaded {}", path.display()),
+        Err(err) => println!("configuration: no .env loaded ({err})"),
+    }
+
     tracing_subscriber::registry()
         .with(
             EnvFilter::try_from_default_env()
