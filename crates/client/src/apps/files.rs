@@ -606,7 +606,9 @@ fn Listing() -> impl IntoView {
                                     .map(format_short_millis)
                                     .unwrap_or_default();
                                 let tooltip = entry.path.clone();
-                                let target = entry.clone();
+                                let row = entry.clone();
+                                let row_for_dbl = entry.clone();
+                                let open_app = open_target(&entry);
                                 let is_dir = entry.kind == EntryKind::Dir;
                                 let blocked = entry.blocked;
                                 let name = entry.name.clone();
@@ -622,7 +624,14 @@ fn Listing() -> impl IntoView {
                                                 .is_some_and(|s| s.path == selected_path)
                                         }
                                         title=tooltip
-                                        on:click=move |_| state.select(target.clone())
+                                        on:click=move |_| state.select(row.clone())
+                                        on:dblclick=move |_| {
+                                            if !is_dir {
+                                                state
+                                                    .desktop
+                                                    .request_open(open_app, row_for_dbl.path.clone());
+                                            }
+                                        }
                                     >
                                         <span class="row-icon">
                                             {match thumb {
@@ -741,9 +750,12 @@ fn preview_head(entry: FsEntry) -> AnyView {
     let rename_path = entry.path.clone();
     let rename_current = entry.name.clone();
     let delete_path = entry.path.clone();
-    let editor_path = entry.path.clone();
-    // Any regular file can be handed over; the editor decides whether it is text.
+    let target_path = entry.path.clone();
+    // Any regular file can be handed over. The type decides the app: an image goes to
+    // the Gallery, everything else to the Text Editor, which says what it is if it
+    // turns out to be binary.
     let openable = !entry.blocked && !is_dir && !entry.path.is_empty();
+    let target = open_target(&entry);
 
     let actions_visible = move || editable;
     let rename_visible = move || editable && !is_dir;
@@ -766,14 +778,13 @@ fn preview_head(entry: FsEntry) -> AnyView {
 
             <button
                 class="ghost-btn"
-                title="Open in the Text Editor"
+                title="Open this file in the app that handles its type"
                 style=move || if openable { "" } else { "display:none" }
                 on:click=move |_| {
-                    state.desktop.pending_editor_file.set(Some(editor_path.clone()));
-                    state.desktop.open_builtin(shared::AppId::Editor);
+                    state.desktop.request_open(target, target_path.clone());
                 }
             >
-                "Open with…"
+                {format!("Open in {}", target.name())}
             </button>
 
             <div class="preview-actions" style=move || {
@@ -831,6 +842,18 @@ fn preview_head(entry: FsEntry) -> AnyView {
         </div>
     }
     .into_any()
+}
+
+/// Which built-in app should open a file, from its name alone.
+///
+/// `looks_like_image` rather than `image_mime` on purpose: a TIFF is still a picture,
+/// and the Gallery is the app that can explain why the browser will not draw it.
+fn open_target(entry: &FsEntry) -> shared::AppId {
+    if looks_like_image(&entry.name) {
+        shared::AppId::Gallery
+    } else {
+        shared::AppId::Editor
+    }
 }
 
 fn icon_for(entry: &FsEntry) -> &'static str {

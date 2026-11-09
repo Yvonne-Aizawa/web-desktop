@@ -26,6 +26,13 @@ pub const TASKBAR_HEIGHT: f64 = 52.0;
 /// Cascade step for newly opened windows.
 const CASCADE: f64 = 34.0;
 
+/// A file to open, and which app should open it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenRequest {
+    pub app: AppId,
+    pub path: String,
+}
+
 /// Handle to an app in the shell's registry.
 ///
 /// A small index rather than the manifest itself, because [`WinData`] has to stay
@@ -102,11 +109,12 @@ pub struct Desktop {
     /// What the backend is willing to expose to the Files app.
     pub fs: RwSignal<FsInfo>,
     pub start_open: RwSignal<bool>,
-    /// A file the Text Editor should open. Files sets it and raises the editor; the
-    /// editor consumes it. A one-shot handoff rather than shared state, so the two
-    /// apps stay independent: whoever is listening takes it, and a second request
-    /// simply replaces an unconsumed one.
-    pub pending_editor_file: RwSignal<Option<String>>,
+    /// A file handed to an app, as `(which app, which path)`.
+    ///
+    /// A one-shot handoff rather than shared state: the app that matches consumes it,
+    /// and a second request replaces an unconsumed one. It is how one app asks another
+    /// to open something without knowing anything about its internals.
+    pub pending_open: RwSignal<Option<OpenRequest>>,
     /// `None` while the first request is in flight, `Some(Err)` if it failed.
     pub health: RwSignal<Option<Result<Health, String>>>,
     /// Kept separate from [`Self::health`] on purpose: the two requests can fail
@@ -134,7 +142,7 @@ impl Desktop {
             wallpaper: RwSignal::new(initial_wallpaper()),
             fs: RwSignal::new(FsInfo::disabled()),
             start_open: RwSignal::new(false),
-            pending_editor_file: RwSignal::new(None),
+            pending_open: RwSignal::new(None),
             health: RwSignal::new(None),
             catalog_error: RwSignal::new(None),
             next_id: RwSignal::new(1),
@@ -227,6 +235,25 @@ impl Desktop {
             .with_untracked(|apps| apps.iter().find(|a| a.builtin_id() == Some(id)).cloned())
             .unwrap_or_else(|| AppManifest::builtin(id));
         self.open_manifest(&manifest);
+    }
+
+    /// Ask an app to open a file, raising it if it is not already running.
+    ///
+    /// The file type decides the app, and callers decide the file type: the shell does
+    /// not keep a table of who opens what.
+    pub fn request_open(self, app: AppId, path: String) {
+        self.pending_open.set(Some(OpenRequest { app, path }));
+        self.open_builtin(app);
+    }
+
+    /// Take a request addressed to `app`, if there is one waiting.
+    pub fn take_open_request(self, app: AppId) -> Option<String> {
+        let request = self.pending_open.get()?;
+        if request.app != app {
+            return None;
+        }
+        self.pending_open.set(None);
+        Some(request.path)
     }
 
     /// Open by slug, for the terminal's `open` command. Fails only when nothing

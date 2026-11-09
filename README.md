@@ -146,9 +146,10 @@ execute, and that matters as soon as writes exist.
 ### Editing
 
 Files manages the *folder* — create file or folder, rename, upload, delete — and
-previews contents read-only. Editing contents belongs to the Text Editor, reached with
-**Open with…** on any file; that is a read, so it is offered even when the root is
-read-only (the editor then turns read-only itself).
+previews contents read-only. **Open in …** hands a file to the app that handles its
+type: images to the Gallery, everything else to the Text Editor. Double-clicking a row
+does the same. Handing a file over is a read, so it is offered even when the root is
+read-only (the target app then turns read-only itself).
 
 Every mutation goes through the same fence as the reads, and writes are gated on
 configuration first:
@@ -350,6 +351,16 @@ One shell interaction: **Set as wallpaper** puts the photo behind the whole desk
 wallpaper is a CSS `background` value, so `url('/api/fs/raw?path=…')` is as valid as a
 gradient — which is also why the catalog refresh no longer replaces a wallpaper it does
 not recognise (it used to, and would have wiped the photo on the next reconnect).
+
+### How one app opens another's file
+
+`Desktop::request_open(app, path)` puts an `OpenRequest` in a one-shot slot and raises
+that app. Each app that accepts files watches the slot for requests addressed to it —
+`take_open_request(AppId::Editor)` — so an app takes only its own and never has to know
+anything about the caller. The type decides the app, and the *caller* decides the type:
+Files routes with `looks_like_image`, which is why a TIFF goes to the Gallery (the app
+that can explain why the browser will not draw it) rather than to the editor as
+"binary". The shell keeps no table of who opens what.
 
 ## Served apps
 

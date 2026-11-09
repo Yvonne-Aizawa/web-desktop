@@ -351,10 +351,10 @@ pub fn Editor() -> impl IntoView {
     provide_context(state);
 
     // Take a file handed over by another app. Reading the signal means this works
-    // whether the editor was just opened or was already on screen.
+    // whether the editor was just opened or was already on screen, and asking for
+    // requests addressed to *this* app leaves another app's request for it to take.
     Effect::new(move |_| {
-        if let Some(path) = state.desktop.pending_editor_file.get() {
-            state.desktop.pending_editor_file.set(None);
+        if let Some(path) = state.desktop.take_open_request(shared::AppId::Editor) {
             state.open_path(path);
         }
     });

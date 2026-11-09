@@ -142,6 +142,29 @@ pub fn Gallery() -> impl IntoView {
     };
     provide_context(state);
 
+    // A photo handed over by another app: show its folder, then the photo. A format
+    // this browser cannot decode is reported instead of opening a viewer that would
+    // only fail.
+    Effect::new(move |_| {
+        let Some(path) = state.desktop.take_open_request(shared::AppId::Gallery) else {
+            return;
+        };
+        let folder = match path.rsplit_once('/') {
+            Some((head, _)) => head.to_owned(),
+            None => String::new(),
+        };
+        state.navigate(folder);
+        let name = path.rsplit('/').next().unwrap_or(&path).to_owned();
+        if image_mime(&name).is_some() {
+            state.size.set(None);
+            state.viewing.set(Some(path));
+        } else {
+            state.notice.set(Some(format!(
+                "{name} is an image format this browser cannot show"
+            )));
+        }
+    });
+
     Effect::new(move |_| {
         let path = state.cwd.get();
         state.reload.track();
