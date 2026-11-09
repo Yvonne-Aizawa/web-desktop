@@ -218,6 +218,13 @@ pub fn Terminal() -> impl IntoView {
                                     file.entry.name,
                                     human_size(file.entry.size)
                                 ))),
+                                // A terminal cannot draw a picture; point at the app
+                                // that can.
+                                PreviewBody::Image { mime } => out.push(Line::err(format!(
+                                    "cat: {}: image ({mime}, {}) — open it in Files to view it",
+                                    file.entry.name,
+                                    human_size(file.entry.size)
+                                ))),
                             },
                             Err(err) => out.push(Line::err(format!("cat: {err}"))),
                         }

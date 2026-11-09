@@ -2,7 +2,9 @@
 
 use gloo_net::http::Request;
 use serde::de::DeserializeOwned;
-use shared::fs::{API_FS_DOWNLOAD, API_FS_LIST, API_FS_PREVIEW, ApiError, DirListing, FilePreview};
+use shared::fs::{
+    API_FS_DOWNLOAD, API_FS_LIST, API_FS_PREVIEW, API_FS_RAW, ApiError, DirListing, FilePreview,
+};
 use shared::{API_CATALOG, API_HEALTH, Catalog, Health};
 
 use crate::format::encode_query;
@@ -28,6 +30,15 @@ pub async fn preview_file(path: &str) -> Result<FilePreview, String> {
 /// URL for the download endpoint, for use in an `<a href>`.
 pub fn download_url(path: &str) -> String {
     format!("{}?path={}", API_FS_DOWNLOAD, encode_query(path))
+}
+
+/// URL for the inline image endpoint, for use in an `<img src>`.
+///
+/// Only image formats the browser can decode are served here; anything else is
+/// refused, so this is safe to point an `<img>` at without checking the type
+/// first (the server has the final say).
+pub fn raw_url(path: &str) -> String {
+    format!("{}?path={}", API_FS_RAW, encode_query(path))
 }
 
 /// `GET` and decode, turning a non-2xx [`ApiError`] body into the message the UI

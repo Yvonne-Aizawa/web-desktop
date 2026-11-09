@@ -26,6 +26,7 @@ crates/
 | `axum` | Routing and handlers; the default choice on tokio/tower |
 | `tokio` | Runtime, `TcpListener`, graceful shutdown |
 | `tower-http` | `ServeDir` for the client bundle, `TraceLayer` for request logs |
+| `tokio-util` | `ReaderStream`, so images and downloads stream instead of buffering |
 | `tracing` + `tracing-subscriber` | Structured logs with `RUST_LOG` support |
 | `serde` / `serde_json` | Wire format, shared with the frontend |
 
@@ -56,8 +57,56 @@ browser's own filesystem sandbox and nothing reaches outside that root.
 | Endpoint | Returns |
 | --- | --- |
 | `GET /api/fs/list?path=` | [`DirListing`](crates/shared/src/fs.rs): entries, kinds, sizes, mtimes |
-| `GET /api/fs/preview?path=` | Text (capped at 256 KiB) or a binary notice with a guessed MIME type |
+| `GET /api/fs/preview?path=` | A text body (capped at 256 KiB), an image marker, or a binary notice with a guessed MIME type |
+| `GET /api/fs/raw?path=` | Image bytes, inline, for an `<img src>` |
 | `GET /api/fs/download?path=` | The raw bytes, capped at 64 MiB, as an attachment |
+
+### Image previews
+
+`/api/fs/raw` exists so the preview pane and the row thumbnails can point an
+`<img>` at a file. `shared::fs::image_mime` is the one list of formats that get
+that treatment — PNG, JPEG, GIF, WebP, BMP, ICO, AVIF and SVG — and it is used by
+both sides: the server picks `PreviewBody::Image` and the response `Content-Type`
+from it, the client decides which rows get a thumbnail from it.
+
+Two things are worth knowing about the shape of this:
+
+* **`preview` does not read images.** It returns `{"type": "image", "mime": ...}`
+  and the bytes come from the second request, so asking about a 20 MB photo costs
+  nothing. Because the two must agree, `preview` applies the same 64 MiB cap that
+  `/raw` would, and reports the limit instead of handing back an `<img>` that can
+  only fail.
+* **Formats browsers cannot decode are not offered.** TIFF, HEIC and PSD are absent
+  from `image_mime`, so they arrive as `PreviewBody::Binary`, keep the picture icon
+  (`looks_like_image` answers "is this an image", which is a different question),
+  and the pane says `Binary file (image/tiff, 300 kB)` rather than showing a broken
+  image. A *misnamed* file — text with a `.png` name — does render, fails to
+  decode, and says so; the browser is the decoder of last resort, and that state is
+  reported honestly rather than hidden.
+
+Row thumbnails are the whole file behind `loading="lazy"`, and only for images up
+to 12 MiB: there is no server-side decoding, so a 40 MB photo would be pulled down
+to fill a 20px box. Above that the row keeps its icon and the preview pane still
+shows the file. Real thumbnailing would mean decoding server-side (`image` crate)
+and caching; that is the natural next step.
+
+### What `/api/fs/raw` is careful about
+
+Serving files inline is how a file browser turns into an XSS vector, so this
+endpoint is deliberately narrow and explicit:
+
+* **Images only.** A path whose extension is not in `image_mime` is refused with a
+  message, so the endpoint can never be used to hand out arbitrary content under a
+  chosen `Content-Type`. Anything else is still reachable through `/download`,
+  which always sends `application/octet-stream` as an attachment.
+* **`X-Content-Type-Options: nosniff`**, so a misnamed file fails to render instead
+  of being reinterpreted as something else.
+* **SVG gets `Content-Security-Policy: default-src 'none'; style-src
+  'unsafe-inline'; sandbox`.** An SVG is a document; if it is ever opened directly
+  rather than through an `<img>`, it must not be able to run script or fetch
+  anything. Rendering inside an `<img>` is unaffected (verified).
+* **`Cache-Control: no-store`**, so an edit on disk is not shadowed by a stale
+  thumbnail. ETags would be the better answer and are not implemented.
 
 Paths on the wire are always root-relative and `/`-separated, with `""` meaning
 the root, so an absolute path never appears in a request.
@@ -80,8 +129,8 @@ pointing at `/etc` fails the same check as `../../etc`, and it is listed with a
 
 Verified against: `..`, `../../etc/passwd`, `testdir/../../etc/passwd`,
 percent-encoded and double-encoded traversal, absolute paths, `..%00`, a symlink
-to `/etc`, a path *through* that symlink, and the same tricks against preview and
-download. All fail closed.
+to `/etc`, a path *through* that symlink, and the same tricks against preview,
+raw and download. All fail closed.
 
 The `/api/fs` routes also reject requests whose `Sec-Fetch-Site` is `cross-site`.
 Reads were never readable cross-origin (no CORS headers) but they did still
@@ -185,4 +234,4 @@ Window layout is in memory only (no persistence, no backend sync), the file
 browser is read-only, and there is no client-side router. Natural next steps:
 persist geometry via `PUT /api/layout`, the write endpoints above, a WebSocket on
 a tokio `broadcast` channel to mirror windows across tabs, `leptos_router` for
-in-window routing, and image thumbnails in the preview pane.
+in-window routing, and real server-side thumbnailing with ETags.

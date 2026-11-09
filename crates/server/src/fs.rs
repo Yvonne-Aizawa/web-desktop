@@ -30,6 +30,7 @@ use std::{
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Query, Request, State},
     http::{HeaderValue, StatusCode, header},
     middleware::{self, Next},
@@ -38,16 +39,20 @@ use axum::{
 };
 use serde::Deserialize;
 use shared::fs::{
-    API_FS_DOWNLOAD, API_FS_LIST, API_FS_PREVIEW, ApiError, DirListing, EntryKind, FilePreview,
-    FsEntry, FsInfo, PreviewBody,
+    API_FS_DOWNLOAD, API_FS_LIST, API_FS_PREVIEW, API_FS_RAW, ApiError, DirListing, EntryKind,
+    FilePreview, FsEntry, FsInfo, PreviewBody, image_mime,
 };
+use tokio_util::io::ReaderStream;
 
 use crate::AppState;
 
 /// Largest text payload returned by the preview endpoint.
 pub const MAX_PREVIEW_BYTES: u64 = 256 * 1024;
-/// Largest file the download endpoint will buffer.
-pub const MAX_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
+/// Largest file any endpoint will hand out, whether streamed (`/raw`,
+/// `/download`) or offered inline as an image. `preview` applies it to images
+/// too, so an image that `/raw` would refuse is refused here with the reason,
+/// instead of the client rendering an `<img>` that has to fail.
+pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 /// Entries returned for one directory before the listing is cut short.
 pub const MAX_ENTRIES: usize = 2_000;
 /// Bytes inspected to decide whether a file is binary.
@@ -58,6 +63,7 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route(API_FS_LIST, get(list))
         .route(API_FS_PREVIEW, get(preview))
+        .route(API_FS_RAW, get(raw))
         .route(API_FS_DOWNLOAD, get(download))
         .route_layer(middleware::from_fn(same_origin))
 }
@@ -348,7 +354,22 @@ async fn preview(
     }
 
     let entry = entry_for(root, &path, &meta);
-    let body = read_preview(&path, meta.len()).await?;
+    let body = match image_mime(&entry.name) {
+        // No point reading a 20 MB photo to say "this is an image".
+        Some(mime) => {
+            if meta.len() > MAX_FILE_BYTES {
+                return Err(FsError::TooLarge(format!(
+                    "`{}` is {} bytes; the limit is {MAX_FILE_BYTES}",
+                    q.path,
+                    meta.len()
+                )));
+            }
+            PreviewBody::Image {
+                mime: mime.to_owned(),
+            }
+        }
+        None => read_preview(&path, meta.len()).await?,
+    };
 
     Ok(Json(FilePreview { entry, body }))
 }
@@ -386,44 +407,125 @@ async fn download(
     State(state): State<Arc<AppState>>,
     Query(q): Query<DownloadQuery>,
 ) -> Result<Response, FsError> {
-    let root = state.fs.as_ref().ok_or_else(FsError::fs_disabled)?;
-    let path = root.resolve(&q.path)?;
+    let (path, meta) = open_file(&state, &q.path).await?;
 
-    let meta = tokio::fs::metadata(&path)
-        .await
-        .map_err(|e| FsError::from_io(&e, &q.path))?;
-    if !meta.is_file() {
-        return Err(FsError::BadRequest(format!(
-            "`{}` is not a regular file",
-            q.path
-        )));
-    }
-    if meta.len() > MAX_DOWNLOAD_BYTES {
-        return Err(FsError::TooLarge(format!(
-            "`{}` is {} bytes; the download limit is {MAX_DOWNLOAD_BYTES}",
-            q.path,
-            meta.len()
-        )));
-    }
-
-    let bytes = tokio::fs::read(&path)
-        .await
-        .map_err(|e| FsError::from_io(&e, &q.path))?;
-
-    let mut response = bytes.into_response();
+    let mut response = stream_file(&path, &meta).await?;
     let headers = response.headers_mut();
     headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
     );
-    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-        // Strip anything that could break out of the quoted filename.
-        let safe: String = name.replace(['"', '\\', '\r', '\n'], "");
-        if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{safe}\"")) {
-            headers.insert(header::CONTENT_DISPOSITION, value);
-        }
-    }
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        disposition("attachment", &path),
+    );
     Ok(response)
+}
+
+/// Serve an image inline, for use as an `<img src>`.
+///
+/// Restricted to the formats [`image_mime`] knows about. This endpoint exists to
+/// render previews, not to hand out arbitrary files under an attacker-influenced
+/// content type, so a file that is not a decodable image is refused here; a file
+/// of any type can still be saved through [`download`], which always sends
+/// `application/octet-stream` as an attachment.
+async fn raw(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<DownloadQuery>,
+) -> Result<Response, FsError> {
+    // Resolve first, so a path outside the root is refused as such rather than
+    // being described by a type check that never looked at the filesystem.
+    let (path, meta) = open_file(&state, &q.path).await?;
+
+    // The name of the *resolved* file, so a link to a photo is still an image.
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mime = image_mime(&name).ok_or_else(|| {
+        FsError::BadRequest(format!(
+            "`{}` is not an image format the browser can render",
+            q.path
+        ))
+    })?;
+
+    let mut response = stream_file(&path, &meta).await?;
+
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
+    headers.insert(header::CONTENT_DISPOSITION, disposition("inline", &path));
+    // The bytes are ours to label, and the label comes from the file name, so a
+    // misnamed file must fail to render rather than be reinterpreted.
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if mime == "image/svg+xml" {
+        // An SVG is a document: if it is ever opened directly rather than through
+        // an `<img>`, it must not be able to run script or fetch anything. This
+        // does not affect rendering inside an `<img>`.
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'; sandbox"),
+        );
+    }
+
+    Ok(response)
+}
+
+/// Resolve a path, require a regular file, and refuse anything over the cap.
+async fn open_file(
+    state: &Arc<AppState>,
+    rel: &str,
+) -> Result<(PathBuf, std::fs::Metadata), FsError> {
+    let root = state.fs.as_ref().ok_or_else(FsError::fs_disabled)?;
+    let path = root.resolve(rel)?;
+
+    let meta = tokio::fs::metadata(&path)
+        .await
+        .map_err(|e| FsError::from_io(&e, rel))?;
+    if !meta.is_file() {
+        return Err(FsError::BadRequest(format!(
+            "`{rel}` is not a regular file"
+        )));
+    }
+    if meta.len() > MAX_FILE_BYTES {
+        return Err(FsError::TooLarge(format!(
+            "`{rel}` is {} bytes; the limit is {MAX_FILE_BYTES}",
+            meta.len()
+        )));
+    }
+
+    Ok((path, meta))
+}
+
+/// Stream a file out without buffering it, so a large image or download does not
+/// sit in memory in full.
+async fn stream_file(path: &Path, meta: &std::fs::Metadata) -> Result<Response, FsError> {
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| FsError::from_io(&e, &path.to_string_lossy()))?;
+
+    let mut response = Body::from_stream(ReaderStream::new(file)).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&meta.len().to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    );
+    Ok(response)
+}
+
+/// `inline; filename="..."`, with anything that could break out of the quoted
+/// string removed.
+fn disposition(kind: &str, path: &Path) -> HeaderValue {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_owned());
+    let safe: String = name.replace(['"', '\\', '\r', '\n'], "");
+    HeaderValue::from_str(&format!("{kind}; filename=\"{safe}\""))
+        .unwrap_or_else(|_| HeaderValue::from_static("attachment"))
 }
 
 fn entry_for(root: &FsRoot, path: &Path, meta: &std::fs::Metadata) -> FsEntry {
@@ -482,6 +584,12 @@ fn guess_mime(path: &Path) -> String {
         "webm" => "video/webm",
         "woff2" => "font/woff2",
         "ttf" => "font/ttf",
+        // Image formats the browser cannot decode: named for the message in the
+        // preview pane, not rendered.
+        "tiff" | "tif" => "image/tiff",
+        "heic" | "heif" => "image/heic",
+        "psd" => "image/vnd.adobe.photoshop",
+        "raw" | "cr2" | "nef" => "image/x-raw",
         _ => "application/octet-stream",
     };
     mime.to_owned()

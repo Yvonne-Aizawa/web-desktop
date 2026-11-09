@@ -1,17 +1,27 @@
 //! The Files app: a real directory on the machine running the backend.
 //!
 //! Nothing here touches a disk. Every listing and preview is a request to
-//! `/api/fs/*`, which is fenced inside one root directory on the server. The app
-//! is read-only, which is why there is no rename/delete UI: the backend
-//! advertises `FsInfo::writable == false`.
+//! `/api/fs/*`, which is fenced inside one root directory on the server. Text and
+//! binary previews arrive as JSON; images are rendered by pointing an `<img>` at
+//! `/api/fs/raw`, which only serves formats the browser can decode. The app is
+//! read-only, which is why there is no rename/delete UI: the backend advertises
+//! `FsInfo::writable == false`.
 
 use leptos::prelude::*;
-use shared::fs::{DirListing, EntryKind, FilePreview, FsEntry, PreviewBody};
+use shared::fs::{
+    DirListing, EntryKind, FilePreview, FsEntry, PreviewBody, image_mime, looks_like_image,
+};
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 
 use crate::api;
 use crate::format::{format_millis, human_size};
 use crate::state::Desktop;
+
+/// Thumbnails are the whole file: there is no server-side decoding, so a 40 MB
+/// photo would be pulled down for a 20px box. Above this size the row keeps its
+/// icon; the preview pane still shows the image.
+const THUMBNAIL_MAX_BYTES: u64 = 12 * 1024 * 1024;
 
 /// State of the current directory listing.
 #[derive(Clone, PartialEq)]
@@ -269,6 +279,7 @@ pub fn Files() -> impl IntoView {
                                         {
                                             let selected_path = entry.path.clone();
                                             let icon = icon_for(&entry);
+                                            let thumb = thumbnail_url(&entry);
                                             let size = match entry.kind {
                                                 EntryKind::File if !entry.blocked => human_size(entry.size),
                                                 _ => String::new(),
@@ -295,7 +306,23 @@ pub fn Files() -> impl IntoView {
                                                     title=tooltip
                                                     on:click=move |_| select(target.clone())
                                                 >
-                                                    <span class="row-icon">{icon}</span>
+                                                    <span class="row-icon">
+                                                        {match thumb {
+                                                            Some(url) => {
+                                                                view! {
+                                                                    <img
+                                                                        class="row-thumb"
+                                                                        src=url
+                                                                        loading="lazy"
+                                                                        decoding="async"
+                                                                        alt=""
+                                                                    />
+                                                                }
+                                                                    .into_any()
+                                                            }
+                                                            None => view! { {icon} }.into_any(),
+                                                        }}
+                                                    </span>
                                                     <span class="row-name">{name}</span>
                                                     <span class="row-size">{size}</span>
                                                     <span class="row-when">{when}</span>
@@ -320,10 +347,21 @@ fn icon_for(entry: &FsEntry) -> &'static str {
     match (entry.blocked, entry.kind) {
         (true, _) => "⛔",
         (_, EntryKind::Dir) => "📁",
+        // Including images too large to thumbnail, and formats the browser cannot
+        // decode: the preview pane explains those.
+        (_, EntryKind::File) if looks_like_image(&entry.name) => "🖼",
         (_, EntryKind::File) if entry.hidden => "🗒",
         (_, EntryKind::File) => "📄",
         _ => "◦",
     }
+}
+
+/// URL for a lazy row thumbnail, or `None` to keep the plain icon.
+fn thumbnail_url(entry: &FsEntry) -> Option<String> {
+    if entry.kind != EntryKind::File || entry.blocked || entry.size > THUMBNAIL_MAX_BYTES {
+        return None;
+    }
+    image_mime(&entry.name).map(|_| api::raw_url(&entry.path))
 }
 
 /// The bottom pane: nothing selected, loading, an error, or a file body.
@@ -356,7 +394,6 @@ fn preview_pane(
         }
         .into_any(),
         Some(Ok(file)) => {
-            let size = human_size(file.entry.size);
             let head = preview_head(file.entry.clone());
             let body = match file.body {
                 PreviewBody::Text { content, truncated } => view! {
@@ -368,9 +405,18 @@ fn preview_pane(
                     <pre>{content}</pre>
                 }
                 .into_any(),
+                PreviewBody::Image { mime } => view! {
+                    <ImagePreview
+                        path=file.entry.path.clone()
+                        name=file.entry.name.clone()
+                        mime=mime
+                    />
+                }
+                .into_any(),
                 PreviewBody::Binary { mime } => view! {
                     <p class="muted">
-                        "Binary file (" {mime} ", " {size} ") — no preview. Use Download to save it."
+                        "Binary file (" {mime} ", " {human_size(file.entry.size)}
+                        ") — no preview. Use Download to save it."
                     </p>
                 }
                 .into_any(),
@@ -383,6 +429,60 @@ fn preview_pane(
             }
             .into_any()
         }
+    }
+}
+
+/// An image from [`api::raw_url`], plus the size the browser decoded it at and an
+/// honest message when it cannot be decoded at all (a misnamed or truncated file,
+/// or a format this build of the browser dropped).
+#[component]
+fn ImagePreview(path: String, name: String, mime: String) -> impl IntoView {
+    let src = api::raw_url(&path);
+    let href = src.clone();
+    let dims = RwSignal::new(None::<(u32, u32)>);
+    let failed = RwSignal::new(false);
+
+    let on_load = move |ev: web_sys::Event| {
+        if let Some(img) = ev
+            .target()
+            .and_then(|t| t.dyn_into::<web_sys::HtmlImageElement>().ok())
+        {
+            dims.set(Some((img.natural_width(), img.natural_height())));
+        }
+    };
+
+    view! {
+        <div class="image-preview">
+            <a
+                class="image-frame"
+                href=href
+                target="_blank"
+                rel="noopener"
+                title="Open in a new tab"
+                style=move || if failed.get() { "display:none" } else { "" }
+            >
+                <img
+                    class="preview-image"
+                    src=src
+                    alt=""
+                    on:load=on_load
+                    on:error=move |_| failed.set(true)
+                />
+            </a>
+            <p class="preview-error" style=move || if failed.get() { "" } else { "display:none" }>
+                "The browser could not decode this file as " {mime}
+                " — it may be misnamed or truncated."
+            </p>
+            <p
+                class="preview-dims"
+                style=move || if failed.get() { "display:none" } else { "" }
+            >
+                {move || match dims.get() {
+                    Some((width, height)) => format!("{width} × {height} px · {name}"),
+                    None => "decoding image…".to_owned(),
+                }}
+            </p>
+        </div>
     }
 }
 
