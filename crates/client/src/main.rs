@@ -10,6 +10,7 @@
 mod api;
 mod apps;
 mod format;
+mod runtime;
 mod start_menu;
 mod state;
 mod taskbar;

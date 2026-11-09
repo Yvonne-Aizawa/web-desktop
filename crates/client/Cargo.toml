@@ -19,6 +19,8 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 gloo-net = { version = "0.7", default-features = false, features = ["http", "json"] }
 gloo-timers = { version = "0.4", features = ["futures"] }
+# Verifying a served app bundle before it is instantiated.
+sha2 = "0.10"
 
 [dependencies.web-sys]
 version = "0.3"
@@ -37,4 +39,5 @@ features = [
     "DomRect",
     "CssStyleDeclaration",
     "Location",
+    "HtmlDivElement",
 ]

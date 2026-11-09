@@ -14,7 +14,9 @@
 //!   WEB_DESKTOP_ROOT  directory the file browser may read, default ~/web-desktop
 //!   WEB_DESKTOP_FS    set to `off` to disable the filesystem API entirely
 //!   WEB_DESKTOP_DIST  path to the built client bundle
+//!   WEB_DESKTOP_APPS  directory of served app bundles, default ./apps
 
+mod apps;
 mod fs;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
@@ -36,7 +38,11 @@ use crate::fs::FsRoot;
 #[derive(Debug)]
 pub struct AppState {
     started: Instant,
+    /// Compiled-in apps and the rest of the bootstrap payload. Served apps are
+    /// merged in per request, so rebuilding one does not need a server restart.
     catalog: Catalog,
+    /// Directory of served app bundles; `None` when there is nothing to serve.
+    apps_dir: Option<PathBuf>,
     /// `None` when the filesystem API is switched off or its root is unusable.
     fs: Option<FsRoot>,
 }
@@ -56,6 +62,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse()?;
 
     let mut catalog = default_catalog();
+
+    // Served apps are appended to the compiled-in ones. They live under
+    // /apps/<id>/<version>/, which is immutable, so the cache policy can treat
+    // everything there as content-addressed.
+    let apps_dir = std::env::var_os("WEB_DESKTOP_APPS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("apps"));
+    let served = apps::scan(&apps_dir);
+    if served.is_empty() {
+        tracing::info!(
+            "no served apps in {} (build one with `cargo xtask build-app crates/apps/<name>`)",
+            apps_dir.display()
+        );
+    } else {
+        tracing::info!("{} served app(s) in {}", served.len(), apps_dir.display());
+    }
+
     let fs_root = match init_fs() {
         Ok(Some(root)) => {
             catalog.fs = root.info(true);
@@ -75,6 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(AppState {
         started: Instant::now(),
         catalog,
+        apps_dir: apps_dir.is_dir().then_some(apps_dir.clone()),
         fs: fs_root,
     });
 
@@ -83,6 +107,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(API_CATALOG, get(catalog_handler))
         .merge(fs::router())
         .with_state(state.clone());
+
+    // App bundles: plain static files, so `ServeDir` handles ranges, MIME types
+    // (it knows .wasm and .js) and path traversal, and picks up precompressed
+    // siblings when `cargo xtask precompress apps` has been run over them.
+    let app = if apps_dir.is_dir() {
+        api.nest_service(
+            "/apps",
+            ServeDir::new(&apps_dir)
+                .precompressed_br()
+                .precompressed_gzip(),
+        )
+    } else {
+        api
+    };
 
     let dist = resolve_dist();
     let index = dist.join("index.html");
@@ -95,7 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `ServeDir` also maps `/` to `index.html`, which is right for an app with
         // no client-side router; with `leptos_router` you would want a history
         // fallback here instead.
-        api.fallback_service(
+        app.fallback_service(
             ServeDir::new(&dist)
                 .precompressed_br()
                 .precompressed_gzip(),
@@ -105,7 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "no client bundle at {} - run `cd crates/client && trunk build` (API only for now)",
             dist.display()
         );
-        api.route(
+        app.route(
             "/",
             get(|| async {
                 "web-desktop API is up. The frontend bundle is missing: run `cd crates/client && trunk build`."
@@ -138,7 +176,13 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Health> {
 }
 
 async fn catalog_handler(State(state): State<Arc<AppState>>) -> Json<Catalog> {
-    Json(state.catalog.clone())
+    let mut catalog = state.catalog.clone();
+    if let Some(dir) = &state.apps_dir {
+        // Rescanned per request: a few small file reads, and it means `cargo xtask
+        // build-app` is picked up by the next page load rather than a server restart.
+        catalog.apps.extend(apps::scan(dir));
+    }
+    Json(catalog)
 }
 
 /// Set up the sandboxed root: `WEB_DESKTOP_ROOT`, else `~/web-desktop`.
@@ -208,8 +252,8 @@ fn home_dir() -> PathBuf {
 
 /// Cache policy, in one place so the three cases cannot drift apart.
 ///
-/// * Content-hashed assets (trunk's `filehash`) and served app bundles under an
-///   immutable version directory: cached forever.
+/// * Content-hashed assets (trunk's `filehash`), where the URL changes whenever
+///   the bytes do: cached forever.
 /// * Everything under `/api/fs/`: `no-store`. A file browser must never show a
 ///   stale view of a file the user just edited, and none of these responses carry
 ///   validators, so `no-cache` would mean a full refetch anyway.
@@ -219,7 +263,7 @@ fn home_dir() -> PathBuf {
 /// A handler that sets its own policy still wins.
 async fn cache_policy(req: Request, next: Next) -> Response {
     let path = req.uri().path();
-    let value = if looks_hashed(path) || path.starts_with("/apps/") {
+    let value = if looks_hashed(path) {
         "public, max-age=31536000, immutable"
     } else if path.starts_with("/api/fs/") {
         "no-store"
@@ -242,9 +286,13 @@ fn looks_hashed(path: &str) -> bool {
     let Some(file) = path.rsplit('/').next() else {
         return false;
     };
+    // The hash width varies (15 and 16 hex characters both turn up, because the wasm
+    // is named `client-<hash>_bg.wasm`), so look for a plausible hex run rather than
+    // an exact width. Trunk owns the names in its output directory, and a false
+    // positive there would only mean an unnecessarily long cache lifetime.
     file.split('-')
         .skip(1)
-        .any(|segment| segment.chars().take_while(char::is_ascii_hexdigit).count() >= 16)
+        .any(|segment| segment.chars().take_while(char::is_ascii_hexdigit).count() >= 12)
 }
 
 /// Find the trunk output dir, accepting a few working directories so that

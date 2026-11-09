@@ -1,0 +1,20 @@
+[package]
+name = "calculator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+app-sdk.workspace = true
+
+# Not optional: the `view!` macro it expands emits absolute `leptos::` paths, and
+# the `#[wasm_bindgen]` export needs that crate in scope too. The SDK covers
+# everything else (Context, the mount contract, the web-sys types it names).
+# No `delegation`: a served app shares the document with the shell, and two
+# delegated instances would double-fire every handler (see the SDK docs).
+leptos = { version = "0.8", features = ["csr"] }
+wasm-bindgen = "0.2"

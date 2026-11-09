@@ -8,6 +8,15 @@ target = "index.html"
 dist = "dist"
 filehash = true
 
+# Precompress as part of the build, so a rebuilt bundle can never be served with a
+# stale (or missing) `.br`/`.gz` sibling. No path argument: `xtask` resolves the
+# shell's dist against the repository root, so this does not depend on the
+# directory trunk happens to run hooks in.
+[[hooks]]
+stage = "post_build"
+command = "cargo"
+command_arguments = ["run", "--package", "xtask", "--", "precompress"]
+
 [watch]
 watch = ["index.html", "style.css", "src", "../shared/src"]
 

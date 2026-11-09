@@ -1,0 +1,10 @@
+{
+  "id": "calculator",
+  "name": "Calculator",
+  "glyph": "⌧",
+  "accent": "#fb923c",
+  "blurb": "Served as its own wasm bundle",
+  "default_width": 320,
+  "default_height": 400,
+  "version": "0.1.0"
+}

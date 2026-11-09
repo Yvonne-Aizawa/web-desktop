@@ -278,7 +278,7 @@ pub fn WindowFrame(id: u32, app: AppRef, live: Memo<WinData>) -> impl IntoView {
             </header>
 
             <div class="window-body">
-                <AppBody app=app />
+                <AppBody app=app window=id />
             </div>
 
             <For each=move || EDGES key=|e| e.key() let:edge>

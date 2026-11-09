@@ -36,14 +36,17 @@ crates/
 | --- | --- |
 | `leptos` (0.8, `csr` + `delegation`) | Signals, `view!` macro, WASM CSR |
 | `wasm-bindgen` / `web-sys` / `js-sys` | DOM, pointer events, `Date` for the clock |
+| `sha2` | Verifying a served app's wasm before instantiating it |
 | `wasm-bindgen-futures` | `spawn_local` to drive the fetch on mount |
 | `gloo-net` | `fetch` wrapper for the two API calls |
 | `gloo-timers` | 1 Hz `Interval` for the taskbar clock |
 | `console_error_panic_hook` | Panics in the browser show a Rust message + stack |
 
 **Build**: `trunk` for the frontend (wasm-bindgen glue, asset pipeline, dev server
-with a `/api` proxy), plain `cargo` for the backend. `[profile.wasm-release]` in
-the root `Cargo.toml` is what `trunk build --release` uses.
+with a `/api` proxy, wasm-opt, precompression hook), plain `cargo` for the backend,
+and an `xtask` crate (`cargo xtask precompress | build-app`) for the rest.
+`[profile.wasm-release]` in the root `Cargo.toml` is what release builds use, for the
+shell and for served apps alike.
 
 Alternatives if you outgrow these: `yew`/`dioxus` instead of `leptos`, `actix-web`
 instead of `axum`, `wgpu`/`egui` instead of DOM widgets, `leptos_axum` server
@@ -167,8 +170,15 @@ Open <http://127.0.0.1:8081>.
 Single port (what you would deploy):
 
 ```bash
-cd crates/client && trunk build --release
+cd crates/client && trunk build --release     # precompresses via a post_build hook
 cd ../.. && cargo run -p server --release     # serves crates/client/dist on :8080
+```
+
+Building an app to serve (see *Served apps*):
+
+```bash
+cargo xtask build-app crates/apps/calculator  # stages apps/calculator/<version>/
+cargo xtask precompress apps                  # if the browser is to get it compressed
 ```
 
 Point the file browser at something other than the default sandbox:
@@ -186,8 +196,9 @@ The frontend works without the backend: it boots from
 
 ## Adding a program
 
-A program is a compile-time variant, not a loaded module, so adding one is five
-edits and the compiler names every one of them:
+Two ways: compile it in (below), or serve it as a bundle (see *Served apps*). A
+compiled-in program is a compile-time variant, so adding one is five edits and the
+compiler names every one of them:
 
 1. `crates/shared/src/lib.rs`: add an `AppId` variant, extend `AppId::ALL` (the
    array *length* is part of the type), and fill in the six `const fn`s — `slug`,
@@ -221,12 +232,12 @@ Two constraints are worth knowing before writing one:
 * **One window per app.** `Desktop::open` dedupes on the app handle and raises the
   existing window.
 
-## Groundwork for server-served apps
+## Catalog tolerance and sizes
 
-The plan is for the server to hand out app *bundles* — a `manifest.json` plus a
-module the shell loads at runtime, with an SDK for writing them. Stage 0 is the
-part that does not need that machinery, and it is in place: the shell can already
-be handed a catalog it cannot fully run.
+Before the app tier could exist, the shell had to survive being handed a catalog it
+cannot fully run, and the bundle had to get small enough that a second wasm module
+per app was not absurd. This part is in place; *Served apps* below is what it was
+for.
 
 **The catalog is data, the programs are code.** `AppManifest::id` is a slug
 (`String`), not an `AppId`. Before this, a server advertising one app from a newer
@@ -265,20 +276,102 @@ link asks for it, so `index.html` carries
 (SVG excepted), gRPC, SSE and bodies under 32 bytes — so the image endpoint does not
 pay for it.
 
-### What stage 1 adds
+## Served apps
 
-The ABI is a **mount contract at the JS boundary**, not a bespoke wasm import
-surface: `manifest.json` plus a module exporting `mount(el, host, props)` and
-`unmount(id)`. That keeps the loading path identical for Rust-wasm apps, plain JS
-apps and any future component-model app, and it avoids wasm-bindgen's `snippets/`
-plumbing for host-provided imports. The remaining work is a loader with a module
-cache, a `host` shim, the SDK crate, an `xtask build-app`, and ABI/version
-negotiation.
+The alternative to compiling a program in: the server hands over a bundle and the
+shell loads it at runtime.
 
-The number to keep in mind: a minimal Leptos app is ~326 KB gzipped on its own, so
-a served app pays for its own copy of the framework. Per-app wasm is the right tier
-for optional and third-party apps; built-ins stay statically linked (all four cost
-~45 KB over the framework today).
+```text
+apps/<id>/<version>/manifest.json   metadata, hash, size, ABI (written by xtask)
+apps/<id>/<version>/app.js          ES module implementing the mount contract
+apps/<id>/<version>/app_bg.wasm     the program
+```
+
+`GET /api/catalog` merges these into the compiled-in apps, so the start menu, the
+taskbar and the window chrome treat them identically — a served app's label, glyph,
+accent and default size all come from its manifest.
+
+### The contract
+
+Deliberately at the JS boundary rather than in wasm imports:
+
+```text
+init(wasm)                instantiate (generated by wasm-bindgen)
+mount(el, host) -> id     render into `el`
+unmount(id)               tear down
+```
+
+`host` is a plain object — `appId`, `windowId`, `size`, `theme`, `log`, `openApp`,
+`close` — not a set of link-time imports. Two reasons: it avoids wasm-bindgen's
+`snippets/` plumbing for host-provided JS, and it is the shape a sandboxed
+(message-passing) implementation needs, so that path stays open.
+
+### Writing one
+
+```bash
+cargo xtask build-app crates/apps/calculator    # build, wasm-bindgen, wasm-opt, hash, stage
+```
+
+An app crate declares itself in `app.json` and writes one function:
+
+```rust
+use app_sdk::prelude::*;
+
+app_sdk::app! {
+    fn my_app(ctx: Context) -> impl IntoView {
+        let theme = ctx.theme();
+        view! { <button on:click=move |_| ctx.open_app("files")>"open Files"</button> }
+    }
+}
+```
+
+It needs `crate-type = ["cdylib"]`, `app-sdk`, and — unavoidably — `leptos` and
+`wasm-bindgen`: `view!` expands to absolute `leptos::` paths, and the `#[wasm_bindgen]`
+export needs its crate in scope. The SDK covers everything else.
+
+**An app must not enable `leptos/delegation`.** The shell enables it, which means the
+shell has a `click` listener on `window` that dispatches by looking for a `$$$click`
+*property* on each node from the event target upwards. That property is an ordinary JS
+function, so a second wasm instance using the same property name is found by the
+shell's walk and vice versa — every handler in the document fires twice. The symptom
+is not a crash but a strange one: a click toggles twice, so the start menu opens and
+immediately closes. `app-sdk` depends on `leptos` without `delegation` for this reason.
+
+### What the shell checks first
+
+* **ABI**: `manifest.abi` must equal `shared::APP_ABI`, otherwise the window says the
+  app needs a newer shell. This is the version negotiation.
+* **Size**: the manifest's `size` is refused above 16 MiB before anything is fetched.
+* **Checksum**: the wasm is sha256'd with `sha2` in Rust and compared with the
+  manifest before instantiation — and the *verified bytes* are what get instantiated,
+  so there is no window between checking and running.
+
+### Constraints to know
+
+* **One instance, many windows.** A module is cached by `id@version` and `mount` is
+  called once per window, so two Calculator windows share code but not state.
+* **Each app is its own reactive world.** A separate wasm instance has its own memory
+  and statics; an app cannot see the shell's signals. Cross-app effects go through the
+  host object or the server.
+* **Apps are trusted code.** The module is imported from our own origin, so it runs
+  with full same-origin privileges, including the file API. Installing an app is
+  trusting it. Untrusted apps would need a separate origin and a sandboxed frame, which
+  is why the contract is shaped so that is a loader swap rather than an SDK rewrite.
+* **A version directory is mutable during development**, so app bundles revalidate
+  rather than being cached forever (the shell's content-hashed assets are immutable).
+  Bump `version` in `app.json` to publish; the URL changes and the old copy ages out.
+* **Precompressed siblings are build output.** `ServeDir` prefers a `.br` when the
+  browser asks for one, so a bundle rebuilt without regenerating them would serve stale
+  bytes. `trunk`'s `post_build` hook runs `cargo xtask precompress` for the shell, and
+  the same command with `apps` covers bundles; `build-app` stages a fresh directory.
+  Integrity checking does not save you here, because a stale sibling is self-consistent.
+
+### Still to come
+
+Per-window `setTitle` and resize notifications (both need a slot in `WinData`, which is
+`Copy` on purpose), a sandboxed origin for untrusted apps, storage quotas, an install
+or uninstall UI, and — if non-Rust apps matter — writing the ABI down in WIT and
+transpiling components with `jco`.
 
 ## How the reactivity is arranged
 
@@ -330,8 +423,7 @@ That shape is load-bearing, so it is worth knowing why:
 ## Not implemented
 
 Window layout is in memory only (no persistence, no backend sync), the file
-browser is read-only, there is no client-side router, and apps are still compiled
-in rather than served (see the stage 1 sketch above). Natural next steps: persist
+browser is read-only and there is no client-side router. Natural next steps: persist
 geometry via `PUT /api/layout`, the file write endpoints above, a WebSocket on a
 tokio `broadcast` channel to mirror windows across tabs, `leptos_router` for
 in-window routing, real server-side thumbnailing with ETags, and precompressed

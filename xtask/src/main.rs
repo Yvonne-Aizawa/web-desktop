@@ -33,10 +33,14 @@ fn main() {
 
     let result = match args.first().map(String::as_str) {
         Some("precompress") => {
-            let dir = args
-                .get(1)
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("crates/client/dist"));
+            // With no argument, the shell's dist. `apps` and `dist` are accepted as
+            // shorthands so the command works whatever directory it is run from.
+            let dir = match args.get(1).map(String::as_str) {
+                None => repo_root().join("crates/client/dist"),
+                Some("dist") => repo_root().join("crates/client/dist"),
+                Some("apps") => repo_root().join("apps"),
+                Some(other) => PathBuf::from(other),
+            };
             precompress(&dir)
         }
         Some("build-app") => match args.get(1) {
@@ -203,7 +207,13 @@ fn build_app(crate_dir: &Path) -> Result<(), String> {
     // 1. the app crate itself
     run(
         Command::new("cargo")
-            .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
+            .args([
+                "build",
+                "--profile",
+                "wasm-release",
+                "--target",
+                "wasm32-unknown-unknown",
+            ])
             .arg("--manifest-path")
             .arg(crate_dir.join("Cargo.toml")),
         "cargo build",
@@ -211,7 +221,7 @@ fn build_app(crate_dir: &Path) -> Result<(), String> {
 
     let target_root = target_dir(crate_dir);
     let raw_wasm = target_root
-        .join("wasm32-unknown-unknown/release")
+        .join("wasm32-unknown-unknown/wasm-release")
         .join(format!("{}.wasm", crate_name.replace('-', "_")));
     if !raw_wasm.is_file() {
         return Err(format!("expected {} to exist", raw_wasm.display()));

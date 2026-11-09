@@ -9,6 +9,13 @@ use serde::{Deserialize, Serialize};
 
 pub mod fs;
 
+/// Interface version between the shell and a served app.
+///
+/// Bump this when the host object or the mount contract changes incompatibly:
+/// `xtask build-app` stamps it into every manifest, and the shell refuses to load
+/// an app it does not implement.
+pub const APP_ABI: &str = "1";
+
 /// Endpoint returning [`Catalog`].
 pub const API_CATALOG: &str = "/api/catalog";
 /// Endpoint returning [`Health`].
@@ -105,6 +112,37 @@ pub struct AppManifest {
     pub blurb: String,
     pub default_width: u32,
     pub default_height: u32,
+    /// Where the program comes from.
+    #[serde(default)]
+    pub source: AppSource,
+}
+
+/// A program compiled into the shell versus one the server hands over.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AppSource {
+    /// Compiled in; `id` resolves through [`AppId::from_slug`].
+    #[default]
+    Builtin,
+    /// Served as its own module, loaded at runtime.
+    Served(ServedApp),
+}
+
+/// Everything the shell needs to fetch and run a served app.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServedApp {
+    /// Directory under `/apps/<id>/<version>/`, immutable once built.
+    pub version: String,
+    /// ES module implementing the mount contract (`init`, `mount`, `unmount`).
+    pub entry: String,
+    /// The wasm the entry module instantiates.
+    pub wasm: String,
+    /// Lowercase hex SHA-256 of `wasm`, checked before it is instantiated.
+    pub sha256: String,
+    /// Bytes of `wasm`, so the shell can refuse an absurd download up front.
+    pub size: u64,
+    /// The [`APP_ABI`] this app was built against.
+    pub abi: String,
 }
 
 impl AppManifest {
@@ -119,6 +157,7 @@ impl AppManifest {
             blurb: id.blurb().to_owned(),
             default_width: width as u32,
             default_height: height as u32,
+            source: AppSource::Builtin,
         }
     }
 
@@ -134,6 +173,7 @@ impl AppManifest {
             blurb: "No catalog entry".to_owned(),
             default_width: 420,
             default_height: 260,
+            source: AppSource::Builtin,
         }
     }
 
@@ -143,9 +183,24 @@ impl AppManifest {
         AppId::from_slug(&self.id)
     }
 
-    /// Whether this build can actually run the app.
+    /// The served bundle, when this app is not compiled in.
+    pub fn served(&self) -> Option<&ServedApp> {
+        match &self.source {
+            AppSource::Served(served) => Some(served),
+            AppSource::Builtin => None,
+        }
+    }
+
+    /// Whether this shell can run the app at all: either it is compiled in, or it
+    /// is served and the frontend has a loader (checked against [`APP_ABI`] there).
     pub fn is_runnable(&self) -> bool {
-        self.builtin_id().is_some()
+        self.builtin_id().is_some() || self.served().is_some()
+    }
+
+    /// Where an app's bundle lives, so both sides agree on the layout.
+    pub fn served_base_url(&self) -> Option<String> {
+        self.served()
+            .map(|s| format!("/apps/{}/{}/", self.id, s.version))
     }
 }
 
@@ -276,6 +331,43 @@ mod catalog_tests {
             serde_json::to_string(&AppManifest::builtin(AppId::Terminal).id).unwrap();
         assert_eq!(from_enum, from_manifest);
         assert_eq!(from_enum, r#""terminal""#);
+    }
+
+    #[test]
+    fn a_served_app_decodes_and_is_runnable() {
+        let json = r##"{
+            "id": "calculator", "name": "Calculator", "glyph": "\u2327", "accent": "#fb923c",
+            "blurb": "does arithmetic", "default_width": 320, "default_height": 320,
+            "source": {"served": {"version": "0.1.0", "entry": "app.js", "wasm": "app_bg.wasm",
+                                  "sha256": "abc123", "size": 4242, "abi": "1"}}
+        }"##;
+        let manifest: AppManifest =
+            serde_json::from_str(json).expect("served manifest must decode");
+        assert!(!manifest.is_runnable() || manifest.builtin_id().is_none());
+        assert!(manifest.served().is_some());
+        assert_eq!(
+            manifest.served_base_url().as_deref(),
+            Some("/apps/calculator/0.1.0/")
+        );
+        assert_eq!(manifest.served().unwrap().size, 4242);
+    }
+
+    #[test]
+    fn a_builtin_manifest_carries_no_bundle() {
+        let manifest = AppManifest::builtin(AppId::Terminal);
+        assert_eq!(manifest.source, AppSource::Builtin);
+        assert!(manifest.served().is_none());
+        assert!(manifest.served_base_url().is_none());
+        assert!(manifest.is_runnable());
+    }
+
+    #[test]
+    fn a_manifest_without_a_source_field_is_a_builtin() {
+        // Forward compatibility with a catalog that predates served apps.
+        let json = r##"{"id":"files","name":"Files","glyph":"g","accent":"#fff",
+                        "blurb":"b","default_width":10,"default_height":10}"##;
+        let manifest: AppManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(manifest.source, AppSource::Builtin);
     }
 
     #[test]
