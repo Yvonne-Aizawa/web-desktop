@@ -145,8 +145,13 @@ execute, and that matters as soon as writes exist.
 
 ### Editing
 
-The Files app edits, creates, renames, uploads and deletes. Every mutation goes
-through the same fence as the reads, and writes are gated on configuration first:
+Files manages the *folder* — create file or folder, rename, upload, delete — and
+previews contents read-only. Editing contents belongs to the Text Editor, reached with
+**Open with…** on any file; that is a read, so it is offered even when the root is
+read-only (the editor then turns read-only itself).
+
+Every mutation goes through the same fence as the reads, and writes are gated on
+configuration first:
 
 | Setting | Effect |
 | --- | --- |
@@ -309,7 +314,9 @@ pay for it.
 `apps/editor.rs` is the third built-in that talks to the file API, and the most
 opinionated about DOM behaviour: several files open at once, one tab each with its own
 draft and dirty state, Save / Save all / Ctrl+S, a line-number gutter, a caret readout,
-and a close that asks before discarding.
+and a close that asks before discarding. Files hands a file to it with **Open with…**,
+through a one-shot slot on `Desktop`, so the editor lands on that file whether it was
+already running or not.
 
 Two details are load-bearing:
 

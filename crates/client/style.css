@@ -1039,14 +1039,6 @@ button {
 
 /* ---------- editor ---------- */
 
-.files-editor {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  min-height: 0;
-  flex: 1;
-}
-
 .editor-bar {
   display: flex;
   align-items: center;
@@ -1060,36 +1052,6 @@ button {
 
 .editor-spacer {
   flex: 1;
-}
-
-.editor-dirty {
-  font-size: 11.5px;
-  color: #fbbf24;
-}
-
-.editor-box {
-  flex: 1;
-  min-height: 160px;
-  resize: vertical;
-  padding: 10px 12px;
-  border-radius: 9px;
-  border: 1px solid var(--stroke-strong);
-  background: rgba(0, 0, 0, 0.32);
-  color: #cdd6e4;
-  font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  font-size: 12px;
-  line-height: 1.55;
-  tab-size: 4;
-  outline: none;
-}
-
-.editor-box:focus {
-  border-color: rgba(96, 165, 250, 0.55);
-}
-
-.editor-box[readonly] {
-  opacity: 0.75;
-  cursor: default;
 }
 
 .files-preview {
@@ -1148,6 +1110,16 @@ button {
   color: var(--muted);
   font-family: ui-monospace, monospace;
   font-variant-numeric: tabular-nums;
+}
+
+.preview-text {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #cdd6e4;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
 }
 
 .files-preview pre {

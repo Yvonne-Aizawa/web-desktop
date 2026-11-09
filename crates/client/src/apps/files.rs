@@ -1,10 +1,15 @@
 //! The Files app: a real directory on the machine running the backend.
 //!
-//! Nothing here touches a disk. Every listing, preview and edit is a request to
+//! Nothing here touches a disk. Every listing, preview and change is a request to
 //! `/api/fs/*`, which is fenced inside one root directory on the server. Text and
 //! binary previews arrive as JSON; images are rendered by pointing an `<img>` at
-//! `/api/fs/raw`. Editing is offered only when the server says the root is
-//! writable, and the reason it is not is shown rather than a dead button.
+//! `/api/fs/raw`.
+//!
+//! This app deliberately does not *edit*: the preview is read-only, and a file is
+//! handed to the Text Editor with "Open with…". Creating, renaming, uploading and
+//! deleting are here, since those are about the folder; changing contents belongs to
+//! the app that owns content. Management is offered only when the server says the root
+//! is writable, and the reason it is not is shown rather than a dead button.
 //!
 //! All of a window's state lives in [`FsView`], a `Copy` handle provided to this
 //! component's subtree, so the toolbar, the listing and the preview pane reach the
@@ -75,9 +80,6 @@ struct FsView {
     busy: RwSignal<bool>,
     /// `(is_error, message)` shown under the toolbar.
     notice: RwSignal<Option<(bool, String)>>,
-    /// Editor buffers: what is in the box, and what is on disk.
-    draft: RwSignal<String>,
-    original: RwSignal<String>,
 }
 
 impl FsView {
@@ -144,8 +146,6 @@ impl FsView {
 
         self.selected.set(Some(entry.clone()));
         self.preview.set(None);
-        self.draft.set(String::new());
-        self.original.set(String::new());
         let mine = self.seq.get_untracked();
         let path = entry.path.clone();
         spawn_local(async move {
@@ -153,38 +153,7 @@ impl FsView {
             if self.seq.get_untracked() != mine {
                 return;
             }
-            if let Ok(file) = &result
-                && let PreviewBody::Text { content, .. } = &file.body
-            {
-                self.draft.set(content.clone());
-                self.original.set(content.clone());
-            }
             self.preview.set(Some(result));
-        });
-    }
-
-    fn save(self) {
-        let Some(entry) = self.selected.get_untracked() else {
-            return;
-        };
-        if !self.writable() {
-            self.warn("this file browser is read-only");
-            return;
-        }
-        let text = self.draft.get_untracked();
-        if text.len() as u64 > self.desktop.fs.get().max_write_bytes {
-            self.warn(format!(
-                "too large to save (limit {})",
-                human_size(self.desktop.fs.get().max_write_bytes)
-            ));
-            return;
-        }
-        // The editor is clean as soon as the write is requested; a failure replaces
-        // this with a warning, and the buffer is untouched either way.
-        self.original.set(text.clone());
-        let path = entry.path.clone();
-        self.run(format!("Saved {}", path), async move {
-            api::write_file(&path, text.as_bytes()).await.map(|_| ())
         });
     }
 
@@ -272,8 +241,6 @@ pub fn Files() -> impl IntoView {
         confirming: RwSignal::new(false),
         busy: RwSignal::new(false),
         notice: RwSignal::new(None),
-        draft: RwSignal::new(String::new()),
-        original: RwSignal::new(String::new()),
     };
     provide_context(state);
 
@@ -289,8 +256,6 @@ pub fn Files() -> impl IntoView {
         if moving {
             state.selected.set(None);
             state.preview.set(None);
-            state.draft.set(String::new());
-            state.original.set(String::new());
         }
         state.loaded_path.set(Some(path.clone()));
         state.load.set(Load::Loading);
@@ -712,8 +677,16 @@ fn PreviewPane() -> impl IntoView {
                     }
                     Some(Err(err)) => view! { <p class="preview-error">{err}</p> }.into_any(),
                     Some(Ok(file)) => match file.body {
-                        PreviewBody::Text { truncated, .. } => {
-                            view! { <Editor truncated=truncated /> }.into_any()
+                        PreviewBody::Text { content, truncated } => {
+                            view! {
+                                <Show when=move || truncated>
+                                    <p class="preview-note">
+                                        "Showing only the first 256 KiB of this file."
+                                    </p>
+                                </Show>
+                                <pre class="preview-text">{content}</pre>
+                            }
+                                .into_any()
                         }
                         PreviewBody::Image { mime } => {
                             view! {
@@ -770,7 +743,7 @@ fn preview_head(entry: FsEntry) -> AnyView {
     let delete_path = entry.path.clone();
     let editor_path = entry.path.clone();
     // Any regular file can be handed over; the editor decides whether it is text.
-    let editable_file = !entry.blocked && !is_dir && !entry.path.is_empty();
+    let openable = !entry.blocked && !is_dir && !entry.path.is_empty();
 
     let actions_visible = move || editable;
     let rename_visible = move || editable && !is_dir;
@@ -794,13 +767,13 @@ fn preview_head(entry: FsEntry) -> AnyView {
             <button
                 class="ghost-btn"
                 title="Open in the Text Editor"
-                style=move || if editable_file { "" } else { "display:none" }
+                style=move || if openable { "" } else { "display:none" }
                 on:click=move |_| {
                     state.desktop.pending_editor_file.set(Some(editor_path.clone()));
                     state.desktop.open_builtin(shared::AppId::Editor);
                 }
             >
-                "✎ Edit"
+                "Open with…"
             </button>
 
             <div class="preview-actions" style=move || {
@@ -858,82 +831,6 @@ fn preview_head(entry: FsEntry) -> AnyView {
         </div>
     }
     .into_any()
-}
-
-/// The text editor: a box bound to the draft, with save, revert and a dirty mark.
-#[component]
-fn Editor(truncated: bool) -> impl IntoView {
-    let state = expect_context::<FsView>();
-
-    let dirty = move || state.draft.get() != state.original.get();
-    let too_big = move || state.draft.get().len() as u64 > state.desktop.fs.get().max_write_bytes;
-
-    let save = move || {
-        if too_big() {
-            state.warn("this file is too large to save");
-            return;
-        }
-        state.save();
-    };
-
-    view! {
-        <div class="files-editor">
-            <div class="editor-bar">
-                <Show when=move || truncated>
-                    <span class="preview-note">
-                        "Only the first 256 KiB was loaded — saving would drop the rest."
-                    </span>
-                </Show>
-                <Show when=move || dirty() && !truncated>
-                    <span class="editor-dirty" title="Unsaved changes">"● unsaved"</span>
-                </Show>
-                <span class="editor-spacer"></span>
-                <Show when=move || state.writable()>
-                    <button
-                        class="ghost-btn"
-                        disabled=move || !dirty()
-                        on:click=move |_| state.draft.set(state.original.get_untracked())
-                    >
-                        "Revert"
-                    </button>
-                    <button
-                        class="ghost-btn primary"
-                        disabled=move || !dirty() || truncated
-                        title="Save (Ctrl+S)"
-                        on:click=move |_| save()
-                    >
-                        "Save"
-                    </button>
-                </Show>
-                <Show when=move || !state.writable()>
-                    <span class="preview-meta">"read-only"</span>
-                </Show>
-            </div>
-            <textarea
-                class="editor-box"
-                spellcheck="false"
-                prop:value=move || state.draft.get()
-                readonly=move || !state.writable()
-                on:input=move |ev| {
-                    state
-                        .draft
-                        .set(
-                            ev
-                                .target()
-                                .and_then(|t| t.dyn_into::<web_sys::HtmlTextAreaElement>().ok())
-                                .map(|el| el.value())
-                                .unwrap_or_default(),
-                        )
-                }
-                on:keydown=move |ev: web_sys::KeyboardEvent| {
-                    if ev.key().eq_ignore_ascii_case("s") && (ev.ctrl_key() || ev.meta_key()) {
-                        ev.prevent_default();
-                        save();
-                    }
-                }
-            ></textarea>
-        </div>
-    }
 }
 
 fn icon_for(entry: &FsEntry) -> &'static str {
