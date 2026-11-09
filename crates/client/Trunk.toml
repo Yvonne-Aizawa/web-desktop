@@ -6,7 +6,7 @@ wasm_opt = "version_131"
 [build]
 target = "index.html"
 dist = "dist"
-filehash = false
+filehash = true
 
 [watch]
 watch = ["index.html", "style.css", "src", "../shared/src"]

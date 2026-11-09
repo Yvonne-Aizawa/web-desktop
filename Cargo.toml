@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/shared", "crates/server", "crates/client"]
+members = ["crates/shared", "crates/server", "crates/client", "xtask"]
 # The client only compiles to wasm, so keep it out of plain `cargo build`/`cargo run`.
 default-members = ["crates/shared", "crates/server"]
 resolver = "3"

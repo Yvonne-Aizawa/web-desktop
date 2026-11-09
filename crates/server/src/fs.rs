@@ -22,6 +22,9 @@
 //! frontend whether to show mutation UI at all, and creation-only paths resolve
 //! by canonicalizing the *parent* (a path that does not exist yet cannot be
 //! canonicalized) - see [`FsRoot::resolve_parent`].
+//!
+//! Caching is decided centrally (`main::cache_policy`): everything here is
+//! `no-store`, because a file browser must never show a stale view.
 
 use std::{
     path::{Component, Path, PathBuf},
@@ -460,7 +463,6 @@ async fn raw(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     if mime == "image/svg+xml" {
         // An SVG is a document: if it is ever opened directly rather than through
         // an `<img>`, it must not be able to run script or fetch anything. This

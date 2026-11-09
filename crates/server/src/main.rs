@@ -19,7 +19,14 @@ mod fs;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
 
-use axum::{Json, Router, extract::State, routing::get};
+use axum::{
+    Json, Router,
+    extract::{Request, State},
+    http::{HeaderValue, header},
+    middleware::{self, Next},
+    response::Response,
+    routing::get,
+};
 use shared::{API_CATALOG, API_HEALTH, Catalog, Health, default_catalog};
 use tower_http::{compression::CompressionLayer, services::ServeDir, trace::TraceLayer};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -81,11 +88,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let index = dist.join("index.html");
     let app = if index.is_file() {
         tracing::info!("serving client bundle from {}", dist.display());
-        // Plain `ServeDir` maps `/` to `index.html` and 404s everything else.
-        // This app has no client-side router, so that is exactly right. If you
-        // add `leptos_router`, swap in a history fallback:
-        //   ServeDir::new(&dist).fallback(ServeFile::new(&index))
-        api.fallback_service(ServeDir::new(&dist))
+        // `precompressed_*` serve the `.br`/`.gz` siblings `cargo xtask
+        // precompress` writes, so brotli quality 11 is paid once at build time
+        // instead of on every request. Both fall back to the plain file when a
+        // sibling is missing, and CompressionLayer covers anything left. Plain
+        // `ServeDir` also maps `/` to `index.html`, which is right for an app with
+        // no client-side router; with `leptos_router` you would want a history
+        // fallback here instead.
+        api.fallback_service(
+            ServeDir::new(&dist)
+                .precompressed_br()
+                .precompressed_gzip(),
+        )
     } else {
         tracing::warn!(
             "no client bundle at {} - run `cd crates/client && trunk build` (API only for now)",
@@ -98,11 +112,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }),
         )
     }
-    // The wasm bundle is ~2.8 MB raw and ~370 KB gzipped, so this is the single
-    // biggest win for load time. tower-http's default predicate compresses
-    // everything except images (SVG is an exception), gRPC, SSE and bodies under
-    // 32 bytes, so the image endpoint does not pay for it.
+    // The wasm bundle is ~800 KB raw, so compression is the biggest single win for
+    // load time. tower-http's default predicate compresses everything except images
+    // (SVG is an exception), gRPC, SSE and bodies under 32 bytes, and it skips
+    // responses that already carry a `content-encoding`, so precompressed assets
+    // are not encoded twice.
     .layer(CompressionLayer::new())
+    .layer(middleware::from_fn(cache_policy))
     .layer(TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -188,6 +204,47 @@ fn home_dir() -> PathBuf {
         .filter(|p| !p.as_os_str().is_empty())
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Cache policy, in one place so the three cases cannot drift apart.
+///
+/// * Content-hashed assets (trunk's `filehash`) and served app bundles under an
+///   immutable version directory: cached forever.
+/// * Everything under `/api/fs/`: `no-store`. A file browser must never show a
+///   stale view of a file the user just edited, and none of these responses carry
+///   validators, so `no-cache` would mean a full refetch anyway.
+/// * The rest, `index.html` above all, since it is what points at the hashes:
+///   revalidate.
+///
+/// A handler that sets its own policy still wins.
+async fn cache_policy(req: Request, next: Next) -> Response {
+    let path = req.uri().path();
+    let value = if looks_hashed(path) || path.starts_with("/apps/") {
+        "public, max-age=31536000, immutable"
+    } else if path.starts_with("/api/fs/") {
+        "no-store"
+    } else {
+        "no-cache"
+    };
+
+    let mut response = next.run(req).await;
+    if !response.headers().contains_key(header::CACHE_CONTROL) {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static(value));
+    }
+    response
+}
+
+/// Whether a path carries a trunk-style content hash, e.g.
+/// `client-7d4238f865daf939_bg.wasm` or `style-b42eb280e7a76748.css`.
+fn looks_hashed(path: &str) -> bool {
+    let Some(file) = path.rsplit('/').next() else {
+        return false;
+    };
+    file.split('-')
+        .skip(1)
+        .any(|segment| segment.chars().take_while(char::is_ascii_hexdigit).count() >= 16)
 }
 
 /// Find the trunk output dir, accepting a few working directories so that
