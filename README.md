@@ -352,6 +352,51 @@ wallpaper is a CSS `background` value, so `url('/api/fs/raw?path=…')` is as va
 gradient — which is also why the catalog refresh no longer replaces a wallpaper it does
 not recognise (it used to, and would have wiped the photo on the next reconnect).
 
+### Letting an app fetch a third-party URL
+
+A served app runs in the browser, so a `fetch` to a host without CORS headers is
+unreadable no matter who asks. `GET /api/proxy?url=<absolute>` makes the request on the
+app's behalf:
+
+```toml
+app-sdk = { workspace = true, features = ["fetch"] }
+```
+
+```rust
+#[derive(serde::Deserialize)]
+struct Thing { id: u32 }
+
+let things: Vec<Thing> = app_sdk::fetch::json("https://api.example.com/things").await?;
+```
+
+`fetch` is an opt-in feature so an app that never makes a request does not carry an HTTP
+client and JSON parsing in its bundle.
+
+**The policy is the feature.** An unrestricted `?url=` is the classic SSRF hole: cloud
+metadata at `169.254.169.254`, other services on loopback, everything on the LAN,
+reachable from this machine. So:
+
+| Setting | Effect |
+| --- | --- |
+| *(default)* | **Off.** Nothing is proxied. |
+| `WEB_DESKTOP_PROXY_HOSTS=api.example.com,example.org` | Those hosts, and their subdomains. |
+| `WEB_DESKTOP_PROXY_ALLOW_PRIVATE=on` | Also allow private, loopback and link-local addresses — for proxying to something of your own. |
+
+What it refuses, and where: only `http`/`https`; the host must be on the list; the host is
+**resolved and every address checked** against the private, loopback, link-local,
+carrier-grade-NAT, benchmarking and reserved ranges (so an internal DNS name cannot stand
+in for a private address); and **every redirect hop is checked again**, because an allowed
+host can redirect anywhere. Requests are `GET` only, carry no caller headers or cookies,
+and are bounded by a 2 MiB body cap, a 10s timeout and 3 redirects. The same
+`Sec-Fetch-Site` guard that covers the file API covers this, so a random page cannot spend
+your network position.
+
+Not defended against, deliberately: DNS rebinding between the address check and the
+connection. The server binds to loopback and the allow-list is explicit. Not included
+either: POST and other methods (the shape is one `enum Request`, so widening it is
+deliberate), per-host secret headers, and any caching. Settings shows whether the proxy is
+on and for which hosts.
+
 ### How one app opens another's file
 
 `Desktop::request_open(app, path)` puts an `OpenRequest` in a one-shot slot and raises

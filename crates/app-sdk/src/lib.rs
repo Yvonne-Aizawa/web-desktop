@@ -39,12 +39,18 @@
 //! walk and vice versa: every handler fires twice. Apps therefore attach direct
 //! listeners, and `app-sdk` depends on `leptos` without the `delegation` feature.
 //!
+//! To read a cross-origin URL, turn on the `fetch` feature (see [`fetch`]): the request
+//! goes through the server, because the browser will not let an app read a response
+//! from a host without CORS headers.
+//!
 //! An app needs `crate-type = ["cdylib"]` and three dependencies: this crate, plus
 //! `leptos` and `wasm-bindgen` — not by choice, but because `view!` expands to
 //! absolute `leptos::` paths and `#[wasm_bindgen]` needs its crate in scope. Nothing
 //! else has to be named: the re-exports below cover the rest.
 
 mod context;
+#[cfg(feature = "fetch")]
+pub mod fetch;
 
 // Reachable only so the generated mount/unmount in an app crate can call it; the
 // `runtime::mount` path is part of the expansion, not of the public API.
@@ -65,6 +71,8 @@ pub use web_sys;
 /// depending on their internals, and so the paths the generated code needs resolve
 /// from one import.
 pub mod prelude {
+    #[cfg(feature = "fetch")]
+    pub use crate::fetch;
     pub use crate::{Context, Size, Theme};
     pub use leptos;
     pub use leptos::prelude::*;

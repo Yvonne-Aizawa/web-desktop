@@ -20,9 +20,15 @@
 //!                     read-only until you say otherwise.
 //!   WEB_DESKTOP_DIST  path to the built client bundle
 //!   WEB_DESKTOP_APPS  directory of served app bundles, default ./apps
+//!   WEB_DESKTOP_PROXY_HOSTS
+//!                     hosts the outbound proxy may reach, comma separated. Unset
+//!                     means no proxying at all.
+//!   WEB_DESKTOP_PROXY_ALLOW_PRIVATE
+//!                     `on` to let the proxy reach private and loopback addresses
 
 mod apps;
 mod fs;
+mod proxy;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
 
@@ -48,6 +54,8 @@ pub struct AppState {
     catalog: Catalog,
     /// Directory of served app bundles; `None` when there is nothing to serve.
     apps_dir: Option<PathBuf>,
+    /// Outbound proxy policy; `None` when it is switched off.
+    proxy: Option<proxy::Proxy>,
     /// `None` when the filesystem API is switched off or its root is unusable.
     fs: Option<FsRoot>,
 }
@@ -67,6 +75,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse()?;
 
     let mut catalog = default_catalog();
+
+    let proxy = proxy::Proxy::from_env();
+    let proxy = if proxy.info().enabled() {
+        tracing::info!(
+            "proxy: reachable hosts: {}{}",
+            proxy.info().hosts.join(", "),
+            if proxy.info().allow_private {
+                " (including private addresses)"
+            } else {
+                ""
+            }
+        );
+        catalog.proxy = proxy.info();
+        Some(proxy)
+    } else {
+        tracing::info!(
+            "proxy off: set WEB_DESKTOP_PROXY_HOSTS=api.example.com to let apps fetch from a host"
+        );
+        None
+    };
 
     // Served apps are appended to the compiled-in ones. They live under
     // /apps/<id>/<version>/, which is immutable, so the cache policy can treat
@@ -112,6 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         started: Instant::now(),
         catalog,
         apps_dir: apps_dir.is_dir().then_some(apps_dir.clone()),
+        proxy,
         fs: fs_root,
     });
 
@@ -119,6 +148,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(API_HEALTH, get(health))
         .route(API_CATALOG, get(catalog_handler))
         .merge(fs::router())
+        // The proxy makes outbound requests on this machine's behalf, so it gets the
+        // same cross-site guard the file API has: a random page must not be able to
+        // spend the user's network position.
+        .route(
+            shared::API_PROXY,
+            get(proxy::get).route_layer(middleware::from_fn(fs::same_origin)),
+        )
         .with_state(state.clone());
 
     // App bundles: plain static files, so `ServeDir` handles ranges, MIME types

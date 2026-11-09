@@ -87,7 +87,7 @@ pub fn router() -> Router<Arc<AppState>> {
 /// *executes* here. That matters as soon as writes exist, and costs nothing now.
 /// `Sec-Fetch-Site` is sent by every current browser; clients that omit it, such
 /// as `curl`, are allowed through.
-async fn same_origin(req: Request, next: Next) -> Result<Response, FsError> {
+pub async fn same_origin(req: Request, next: Next) -> Result<Response, FsError> {
     let cross_site = req
         .headers()
         .get("sec-fetch-site")

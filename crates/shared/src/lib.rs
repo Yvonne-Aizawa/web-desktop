@@ -20,6 +20,13 @@ pub const APP_ABI: &str = "1";
 pub const API_CATALOG: &str = "/api/catalog";
 /// Endpoint returning [`Health`].
 pub const API_HEALTH: &str = "/api/health";
+/// `GET` with `?url=<absolute url>`: fetch a third-party URL on the app's behalf.
+///
+/// The point is CORS: a served app runs in the browser, so a response from a host
+/// without CORS headers is unreadable no matter who asks. Asking the server to make
+/// the request sidesteps that, and puts the decision about *which* hosts are reachable
+/// where it cannot be bypassed.
+pub const API_PROXY: &str = "/api/proxy";
 
 /// Every application the desktop can open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -246,6 +253,26 @@ pub struct Catalog {
     pub apps: Vec<AppManifest>,
     pub wallpapers: Vec<Wallpaper>,
     pub fs: fs::FsInfo,
+    /// What the outbound proxy will do, so an app (and Settings) can tell whether
+    /// fetching a third-party URL is even possible here.
+    #[serde(default)]
+    pub proxy: ProxyInfo,
+}
+
+/// What the outbound proxy allows. Empty `hosts` means it is off.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ProxyInfo {
+    pub hosts: Vec<String>,
+    /// Whether private and loopback addresses are reachable (off unless asked for).
+    pub allow_private: bool,
+    pub max_bytes: u64,
+    pub timeout_secs: u64,
+}
+
+impl ProxyInfo {
+    pub fn enabled(&self) -> bool {
+        !self.hosts.is_empty()
+    }
 }
 
 /// Liveness payload for the About/Settings panels.
@@ -264,6 +291,7 @@ pub fn default_catalog() -> Catalog {
         apps: AppId::ALL.into_iter().map(AppManifest::from).collect(),
         wallpapers: default_wallpapers(),
         fs: fs::FsInfo::disabled(),
+        proxy: ProxyInfo::default(),
     }
 }
 
@@ -327,7 +355,9 @@ mod catalog_tests {
                  "blurb":"plays things","default_width":520,"default_height":360}
             ],
             "wallpapers": [],
-            "fs": {"enabled":false,"root":"","writable":false,"max_preview_bytes":0}
+            "fs": {"enabled":false,"root":"","writable":false,"max_preview_bytes":0},
+            "proxy": {"hosts": ["example.org"], "allow_private": false,
+                      "max_bytes": 1024, "timeout_secs": 5}
         }"##;
 
         let catalog: Catalog =
@@ -341,6 +371,8 @@ mod catalog_tests {
         // Still displayable, which is the whole point of keeping it.
         assert_eq!(catalog.apps[1].name, "Music");
         assert_eq!(catalog.apps[1].accent, "#f472b6");
+        assert!(catalog.proxy.enabled());
+        assert_eq!(catalog.proxy.hosts, ["example.org"]);
     }
 
     #[test]
@@ -389,6 +421,14 @@ mod catalog_tests {
                         "blurb":"b","default_width":10,"default_height":10}"##;
         let manifest: AppManifest = serde_json::from_str(json).unwrap();
         assert_eq!(manifest.source, AppSource::Builtin);
+    }
+
+    #[test]
+    fn a_catalog_without_a_proxy_block_is_off() {
+        let json = r##"{"hostname":"h","apps":[],"wallpapers":[],
+                        "fs":{"enabled":false,"root":"","writable":false,"max_preview_bytes":0}}"##;
+        let catalog: Catalog = serde_json::from_str(json).unwrap();
+        assert!(!catalog.proxy.enabled());
     }
 
     #[test]

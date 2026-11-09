@@ -120,6 +120,42 @@ pub fn Settings() -> impl IntoView {
             </section>
 
             <section class="pane">
+                <h3>"Outbound proxy"</h3>
+                <Show
+                    when=move || desktop.proxy.get().enabled()
+                    fallback=move || {
+                        view! {
+                            <div class="kv">
+                                <span>"status"</span>
+                                <span class="badge badge-wait">"off"</span>
+                            </div>
+                            <p class="muted">
+                                "Apps cannot fetch a cross-origin URL. Start the server with `WEB_DESKTOP_PROXY_HOSTS=api.example.com` to allow it."
+                            </p>
+                        }
+                    }
+                >
+                    <div class="kv">
+                        <span>"status"</span>
+                        <span class="badge badge-ok">"on"</span>
+                    </div>
+                    <div class="kv">
+                        <span>"hosts"</span>
+                        <span class="path-value">{move || desktop.proxy.get().hosts.join(", ")}</span>
+                    </div>
+                    <div class="kv">
+                        <span>"private addresses"</span>
+                        <span>{move || {
+                            if desktop.proxy.get().allow_private { "allowed" } else { "refused" }
+                        }}</span>
+                    </div>
+                    <p class="muted">
+                        "Requests are made by the server, so CORS does not apply. Redirects are re-checked against the same list."
+                    </p>
+                </Show>
+            </section>
+
+            <section class="pane">
                 <h3>"Windows"</h3>
                 <div class="kv">
                     <span>"open"</span>
