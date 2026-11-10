@@ -1,0 +1,6 @@
+# The probes drive a real browser, so they need a real WebDriver client.
+# `pillow` is for the fixture images and for reading pixels back out of a
+# screenshot; `brotli` is for checking what the shell costs over the wire.
+selenium==4.52.0
+pillow==13.0.0
+brotli==1.2.1

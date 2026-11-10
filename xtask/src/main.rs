@@ -6,6 +6,8 @@
 //!                       `crates/client/dist`)
 //!   build-app <dir>     build an app crate into the served app layout, with a
 //!                       manifest that carries its hash, size and ABI version
+//!   e2e [options]       build everything, then drive a real browser through the
+//!                       suite in `crates/e2e` (see that directory's README)
 //!
 //! Kept out of the server and the client on purpose: `brotli`, `flate2` and `sha2`
 //! are build-time concerns, and `wasm-bindgen`/`wasm-opt` are binaries we only need
@@ -47,12 +49,14 @@ fn main() {
             Some(dir) => build_app(Path::new(dir)),
             None => Err("usage: cargo xtask build-app <crate-dir>".to_owned()),
         },
+        Some("e2e") => e2e(&args[1..]),
         Some(other) => Err(format!("unknown command `{other}`")),
         None => {
             eprintln!(
                 "usage:\n  \
                  cargo xtask precompress [dir]\n  \
-                 cargo xtask build-app <crate-dir>"
+                 cargo xtask build-app <crate-dir>\n  \
+                 cargo xtask e2e [--list] [--only name,name] [--no-build] [--keep] [--skip-network]"
             );
             std::process::exit(2);
         }
@@ -356,6 +360,98 @@ fn find_cached_tool(name: &str) -> Result<PathBuf, String> {
             cache.display()
         )
     })
+}
+
+// ----------------------------------------------------------------------- e2e
+
+/// Everything the suite needs built, and a Python environment to drive it.
+/// The heavy options are passed straight through to `crates/e2e/run.py`.
+fn e2e(args: &[String]) -> Result<(), String> {
+    let root = repo_root();
+    let suite = root.join("crates/e2e");
+    if !suite.is_dir() {
+        return Err(format!("{} is missing", suite.display()));
+    }
+
+    let mut passthrough = Vec::new();
+    let mut build = true;
+    let mut list = false;
+    for arg in args {
+        match arg.as_str() {
+            "--no-build" => build = false,
+            "--list" => {
+                list = true;
+                passthrough.push(arg.clone());
+            }
+            _ => passthrough.push(arg.clone()),
+        }
+    }
+
+    let work = root.join("target/e2e");
+
+    if build && !list {
+        println!("xtask e2e: building the server, the shell and the served apps");
+        run(
+            Command::new("cargo")
+                .args(["build", "--release", "-p", "server"])
+                .current_dir(&root),
+            "cargo build --release -p server",
+        )?;
+        run(
+            Command::new("trunk")
+                .args(["build", "--release"])
+                .current_dir(root.join("crates/client")),
+            "trunk build --release (is trunk installed?)",
+        )?;
+        for app in ["calculator", "pokedex"] {
+            build_app(&root.join("crates/apps").join(app))?;
+        }
+        // the shell serves the precompressed siblings directly
+        precompress(&root.join("crates/client/dist"))?;
+        precompress(&root.join("apps"))?;
+    }
+
+    let python = ensure_venv(&work, &suite)?;
+    let mut command = Command::new(&python);
+    command
+        .arg(suite.join("run.py"))
+        .args(&passthrough)
+        .current_dir(&root)
+        .env("E2E_PYTHON", &python)
+        .env("E2E_REPO", &root)
+        .env("E2E_WORK", work.join("work"))
+        .env("E2E_DIST", root.join("crates/client/dist"))
+        .env("E2E_APPS", root.join("apps"));
+    run(&mut command, "the browser suite")
+}
+
+/// A throwaway venv under `target/`, so the suite never depends on (or disturbs)
+/// whatever Python the machine happens to have.
+fn ensure_venv(work: &Path, suite: &Path) -> Result<PathBuf, String> {
+    let venv = work.join("venv");
+    let python = venv.join("bin/python");
+    if !python.exists() {
+        fs::create_dir_all(work).map_err(|e| format!("{}: {e}", work.display()))?;
+        run(
+            Command::new("python3").args(["-m", "venv"]).arg(&venv),
+            "python3 -m venv",
+        )?;
+    }
+    let ready = Command::new(&python)
+        .args(["-c", "import selenium, PIL, brotli"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ready {
+        println!("xtask e2e: installing the suite's Python packages");
+        run(
+            Command::new(&python)
+                .args(["-m", "pip", "install", "-q", "-r"])
+                .arg(suite.join("requirements.txt")),
+            "pip install -r crates/e2e/requirements.txt",
+        )?;
+    }
+    Ok(python)
 }
 
 fn run(command: &mut Command, what: &str) -> Result<(), String> {
