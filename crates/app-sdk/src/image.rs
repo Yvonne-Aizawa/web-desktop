@@ -31,7 +31,8 @@
 //! [`encode_base64`], and put it on [`ImageRequest::input_images`]. The gateway checks
 //! each one — that it is base64, how big it is, and that the bytes start like a PNG, a JPEG
 //! or a WebP — so a file that is not a picture a model can take is refused with a sentence
-//! rather than forwarded.
+//! rather than forwarded. It then hands the provider the `data:` URI the provider insists
+//! on, with the type read from the bytes rather than from the file's name.
 //!
 //! ```no_run
 //! # async fn example(source_bytes: Vec<u8>) {

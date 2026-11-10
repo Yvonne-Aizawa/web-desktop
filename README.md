@@ -625,9 +625,11 @@ image is a larger bill), **the count is capped** at what the provider itself acc
 img2img request's **reference images are bounded** — how many, how big each, how big in
 total, that each is really base64, and that the bytes behind it really start like a PNG, a
 JPEG or a WebP. That last one is the only place a caller supplies file *content* rather
-than a name, so it is checked rather than trusted. The response ceiling is far higher than
-a chat's, because one base64 PNG is hundreds of kilobytes and a batch is megabytes, and the
-request ceiling is raised past axum's 2 MiB default for the same reason.
+than a name, so it is checked rather than trusted — and it is also where the shape is
+settled: the provider wants a `data:` URI and the server writes the type from those bytes,
+not from whatever a caller or a file extension claimed. The response ceiling is far higher
+than a chat's, because one base64 PNG is hundreds of kilobytes and a batch is megabytes,
+and the request ceiling is raised past axum's 2 MiB default for the same reason.
 
 The one thing the server adds on the way through is a **sniffed MIME type**. The provider
 returns `b64_json` and never says which format it produced — FLUX hands back JPEG unless

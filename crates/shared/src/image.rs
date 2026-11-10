@@ -108,8 +108,14 @@ pub struct ImageRequest {
     /// provider's own default, which is why the response reports what it actually got.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_format: Option<String>,
-    /// Reference images for the img2img and editing models: base64 of the file's bytes,
-    /// with no `data:` prefix, one per image. Empty means text-to-image.
+    /// Reference images for the img2img and editing models, one per image; empty means
+    /// text-to-image. Base64 of the file's bytes, either bare or already framed as a
+    /// `data:<mime>;base64,` URI.
+    ///
+    /// The provider insists on the `data:` form and refuses bare base64, so the server
+    /// normalises: it validates the payload and writes the prefix from the type it reads
+    /// in the bytes, not from whatever a caller claimed. See
+    /// [`crate::image::accepts_input_mime`] for what it will take.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input_images: Vec<String>,
     /// Diffusion steps, for the FLUX and SDXL variants that accept it. More is slower

@@ -303,7 +303,7 @@ async fn generate(
         )
     })?;
 
-    let prompt = validate(&request)?;
+    let prepared = validate(&request)?;
     let model = images.resolve_model(request.model.as_deref())?;
     let size = images.resolve_size(request.size.as_deref())?;
 
@@ -313,7 +313,7 @@ async fn generate(
     // which is where the provider routes them from.
     let mut body = serde_json::json!({
         "model": model,
-        "prompt": prompt,
+        "prompt": prepared.prompt,
         "n": request.n,
         "size": size,
         // The provider hosts no result URLs, for privacy; this is the only format it
@@ -334,12 +334,12 @@ async fn generate(
     if let Some(seed) = request.seed {
         object.insert("seed".to_owned(), serde_json::Value::from(seed));
     }
-    // The reference images that make this img2img rather than text-to-image. Sent as the
-    // bare base64 the provider documents, not as `data:` URLs.
-    if !request.input_images.is_empty() {
+    // The reference images that make this img2img rather than text-to-image, already
+    // normalised into the `data:` URI the provider insists on.
+    if !prepared.references.is_empty() {
         object.insert(
             "input_images".to_owned(),
-            serde_json::Value::from(request.input_images.clone()),
+            serde_json::Value::from(prepared.references),
         );
     }
     if let Some(steps) = request.steps {
@@ -435,10 +435,18 @@ async fn generate(
     }))
 }
 
+/// A request that passed every check, in the shape the provider is given.
+#[derive(Debug)]
+struct Prepared {
+    /// Trimmed, which is what goes out.
+    prompt: String,
+    /// `input_images`, normalised into the `data:` URIs the provider insists on. Empty
+    /// means text-to-image.
+    references: Vec<String>,
+}
+
 /// What a request has to look like before anything is sent.
-///
-/// Returns the trimmed prompt, which is what goes out.
-fn validate(request: &ImageRequest) -> Result<&str, ImageError> {
+fn validate(request: &ImageRequest) -> Result<Prepared, ImageError> {
     let prompt = request.prompt.trim();
     if prompt.is_empty() {
         return Err(ImageError::BadRequest(
@@ -485,17 +493,25 @@ fn validate(request: &ImageRequest) -> Result<&str, ImageError> {
             "`guidance` must be between 0 and {MAX_GUIDANCE}"
         )));
     }
-    validate_references(&request.input_images)?;
-    Ok(prompt)
+
+    Ok(Prepared {
+        prompt: prompt.to_owned(),
+        references: resolve_references(&request.input_images)?,
+    })
 }
 
-/// Check the img2img reference images before any of them is forwarded.
+/// Check the img2img reference images, and hand back what the provider is sent.
 ///
 /// The one thing a caller controls here is file *content* — megabytes of base64 that the
 /// server hands to the provider — so this is the boundary that bounds it: how many, how
 /// big each, how big in total, and that each one really is a raster image rather than
 /// arbitrary bytes wearing a reference's clothes.
-fn validate_references(images: &[String]) -> Result<(), ImageError> {
+///
+/// It is also where the shape is settled. The provider wants a `data:` URI and refuses
+/// bare base64, so a caller may send either and this returns the URI; the type in it is
+/// [`sniff_mime`]'s reading of the bytes, never the caller's claim, so a file whose
+/// extension lies cannot get the provider to decode it as something it is not.
+fn resolve_references(images: &[String]) -> Result<Vec<String>, ImageError> {
     if images.len() > MAX_INPUT_IMAGES {
         return Err(ImageError::BadRequest(format!(
             "{} reference images; the limit is {MAX_INPUT_IMAGES}",
@@ -504,9 +520,15 @@ fn validate_references(images: &[String]) -> Result<(), ImageError> {
     }
 
     let mut total = 0usize;
+    let mut out = Vec::with_capacity(images.len());
     for (index, data) in images.iter().enumerate() {
         let number = index + 1;
-        let Some(decoded) = base64_len(data) else {
+        let Some(payload) = reference_payload(data) else {
+            return Err(ImageError::BadRequest(format!(
+                "reference image {number} is not a `data:` URI or base64"
+            )));
+        };
+        let Some(decoded) = base64_len(payload) else {
             return Err(ImageError::BadRequest(format!(
                 "reference image {number} is not base64"
             )));
@@ -525,14 +547,30 @@ fn validate_references(images: &[String]) -> Result<(), ImageError> {
                 MAX_INPUT_TOTAL / (1024 * 1024)
             )));
         }
-        let mime = sniff_mime(data);
+        let mime = sniff_mime(payload);
         if !accepts_input_mime(mime) {
             return Err(ImageError::BadRequest(format!(
                 "reference image {number} is not a PNG, JPEG or WebP"
             )));
         }
+        out.push(format!("data:{mime};base64,{payload}"));
     }
-    Ok(())
+    Ok(out)
+}
+
+/// The base64 payload of a reference, with any `data:<mime>;base64,` prefix removed.
+///
+/// `None` for something that is neither: a URL, say, which the provider would fetch
+/// itself. This gateway's promise is that a caller supplies file content the server has
+/// checked, so a reference the server cannot see into is refused rather than passed on.
+fn reference_payload(data: &str) -> Option<&str> {
+    let data = data.trim();
+    match data.strip_prefix("data:") {
+        // `;base64,` rather than `,` alone: a percent-encoded `data:image/png,...` is not
+        // base64 and would only fail later, with a worse message.
+        Some(rest) => rest.split_once(";base64,").map(|(_, payload)| payload),
+        None => Some(data),
+    }
 }
 
 /// The decoded length of a base64 body, or `None` when it is not base64 at all.
@@ -743,8 +781,13 @@ mod tests {
                         .into_response(),
                     "img2img" => {
                         // The whole point of the mode: what the app sent as a reference
-                        // and as model extras arrived at the provider unchanged.
-                        assert_eq!(body["input_images"][0], TINY_PNG);
+                        // and as model extras arrived at the provider unchanged, with the
+                        // reference in the `data:` shape the provider insists on rather
+                        // than the bare base64 the app sends.
+                        assert_eq!(
+                            body["input_images"][0],
+                            format!("data:image/png;base64,{TINY_PNG}")
+                        );
                         assert_eq!(body["steps"], 20);
                         assert_eq!(body["guidance"], 3.5);
                         (
@@ -950,7 +993,68 @@ mod tests {
     #[test]
     fn the_prompt_comes_back_trimmed() {
         let request = ImageRequest::new("  a ship  ");
-        assert_eq!(validate(&request).unwrap(), "a ship");
+        assert_eq!(validate(&request).unwrap().prompt, "a ship");
+    }
+
+    #[test]
+    fn a_reference_leaves_as_the_data_uri_the_provider_insists_on() {
+        // Bare base64: what the app sends, because it has the bytes and not a type it
+        // would like to vouch for.
+        let bare = ImageRequest::new("a ship").with_input_images(vec![TINY_PNG.to_owned()]);
+        assert_eq!(
+            validate(&bare).unwrap().references,
+            vec![format!("data:image/png;base64,{TINY_PNG}")]
+        );
+
+        // A data URI is accepted too, and comes out the same, so a caller that already
+        // has one does not have to take it apart.
+        let uri = ImageRequest::new("a ship")
+            .with_input_images(vec![format!("data:image/png;base64,{TINY_PNG}")]);
+        assert_eq!(
+            validate(&uri).unwrap().references,
+            validate(&bare).unwrap().references
+        );
+    }
+
+    #[test]
+    fn the_prefix_a_caller_writes_does_not_decide_the_type() {
+        // A data URI whose declared type is not what the bytes are: the sniff wins, so a
+        // mislabelled file cannot have the provider decode it as something else.
+        let lying = ImageRequest::new("a ship")
+            .with_input_images(vec![format!("data:image/gif;base64,{TINY_PNG}")]);
+        let references = validate(&lying).unwrap().references;
+        assert!(
+            references[0].starts_with("data:image/png;base64,"),
+            "{}",
+            references[0]
+        );
+    }
+
+    #[test]
+    fn a_reference_the_server_cannot_see_into_is_refused() {
+        // What `reference_payload` accepts and what it does not. A URL is the interesting
+        // refusal: the provider would fetch it itself, and then the bytes are not ones
+        // this gateway ever checked.
+        assert_eq!(reference_payload("aGk="), Some("aGk="));
+        assert_eq!(
+            reference_payload("data:image/png;base64,aGk="),
+            Some("aGk=")
+        );
+        assert_eq!(reference_payload("data:image/png;base64,"), Some(""));
+        assert_eq!(
+            reference_payload("https://example.test/a.png"),
+            Some("https://example.test/a.png")
+        );
+        assert_eq!(
+            reference_payload("data:image/png,aGk="),
+            None,
+            "not base64-framed"
+        );
+
+        // A URL reaches `base64_len` and fails there, which is the refusal that matters.
+        let url = ImageRequest::new("a ship")
+            .with_input_images(vec!["https://example.test/a.png".to_owned()]);
+        assert!(matches!(validate(&url), Err(ImageError::BadRequest(_))));
     }
 
     #[tokio::test]
