@@ -58,6 +58,14 @@ PROXY = {"kind": "web", "port": 8096, "env": {
     "WEB_DESKTOP_PROXY_ALLOW_PRIVATE": "on",
 }, "also": [{"kind": "python", "script": "serve/upstream_serve.py", "port": 8099,
              "role": "upstream"}]}
+# a locked server: the bcrypt hash below is of the passphrase the probe types, at cost
+# 4 so the suite does not spend a second hashing. Regenerate it with
+# `cargo xtask hash-password` if the passphrase is ever changed.
+AUTH = {"kind": "web", "port": 8099, "env": {
+    "WEB_DESKTOP_PASSWORD_HASH": "$2b$04$1gKxhVtjiVoc2J63v9cRA.WVoE6dDokTQaIvkPMQXHAZm51HL4e0e",
+    "WEB_DESKTOP_SECRET": "e2e-signing-key-not-a-real-secret",
+    "WEB_DESKTOP_SESSION_DAYS": "1",
+}}
 
 
 class Scenario:
@@ -97,6 +105,9 @@ SCENARIOS = [
     Scenario("proxy", "probe_proxy.py", servers=(PROXY,), port=8096),
     Scenario("trash", "probe_trash.py", fixture="trash", port=8096, readonly="Lumina"),
     Scenario("readonly", "probe_readonly.py", fixture="readonly", port=8098, write=False),
+    # a password from the environment, checked by the shell's login screen
+    Scenario("auth", "probe_auth.py", fixture="root", port=8099,
+             servers=(AUTH,), env={"PROBE_PASSWORD": "correct horse"}),
     # the same shell twice: once with the proxy allowed to reach pokeapi.co, once
     # with no proxy at all, to show what the app says when it cannot fetch
     Scenario("pokedex", "probe_pokedex.py", port=8094, network=True, servers=({

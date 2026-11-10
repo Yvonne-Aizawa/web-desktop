@@ -247,9 +247,9 @@ enforced against the file browser itself, which until now would happily delete i
 
 `cargo xtask e2e` builds everything and drives a real Firefox through the app: the window
 manager, the file browser, image previews, the editor, the gallery, the served apps, the
-proxy, the trash and the read-only fence. It is the only test here that answers "does it
-work when a person clicks it?"; see `crates/e2e/README.md` for what it covers and how to
-run one scenario while working on it.
+proxy, the trash, the read-only fence and the login screen. It is the only test here that
+answers "does it work when a person clicks it?"; see `crates/e2e/README.md` for what it
+covers and how to run one scenario while working on it.
 
 ### Configuration
 
@@ -266,6 +266,9 @@ cp .env.example .env      # then edit
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `WEB_DESKTOP_ADDR` | `127.0.0.1:8080` | Listen address |
+| `WEB_DESKTOP_PASSWORD_HASH` | empty (no login) | bcrypt hash of the password; generate with `cargo xtask hash-password` |
+| `WEB_DESKTOP_SECRET` | empty (random per start) | Key session cookies are signed with |
+| `WEB_DESKTOP_SESSION_DAYS` | `7` | How long a signed-in browser stays signed in |
 | `WEB_DESKTOP_ROOT` | `~/web-desktop` | The one directory the file browser may touch |
 | `WEB_DESKTOP_FS` | on | `off` disables the file API |
 | `WEB_DESKTOP_FS_WRITE` | on for the sandbox, off for a chosen root | `on`/`off` for editing |
@@ -301,6 +304,57 @@ binary).
 
 The frontend works without the backend: it boots from
 `shared::default_catalog()` and shows the backend as offline.
+
+### Password login
+
+If you ever reach this server from somewhere other than your own machine, put a
+password in front of it:
+
+```bash
+cargo xtask hash-password          # prompts, prints one bcrypt hash to stdout
+```
+
+```ini
+WEB_DESKTOP_PASSWORD_HASH=$2b$12$...
+WEB_DESKTOP_SECRET=a-long-random-string
+```
+
+That is the whole setup. Restart the server and the next page load is a login screen;
+after that, the browser holds a session until it expires or you press *Sign out* in
+Settings.
+
+What this is and is not:
+
+* **One password, one account.** There is no username, no user table and no per-user
+  data. The point is keeping the endpoint to yourself, not separating users. Every
+  signed-in browser sees the same files.
+* **The password is a bcrypt hash in the environment.** The plaintext is never stored
+  and never written to disk. `cargo xtask hash-password` reads the password from stdin
+  rather than an argument, so it does not land in your shell history or in `ps`.
+* **The session is a signed HTTP-only cookie** holding nothing but its own expiry.
+  It cannot be read by JavaScript, and a forged value fails the signature check, which
+  is the only thing that says whether you are signed in. `WEB_DESKTOP_SECRET` is the
+  signing key: without it a random key is used each start, which works but signs you
+  out whenever the server restarts.
+* **Everything under `/api/` is behind it** except the four endpoints the login screen
+  itself needs. `/api/session` says whether a password is configured and whether this
+  browser has a session; `/api/login` and `/api/logout` are how one is obtained and
+  dropped.
+* **HTTP is not encrypted, so this is not TLS.** On plain HTTP the password crosses the
+  network in the clear — fine over loopback or an SSH tunnel, not fine on an open
+  network. Put a TLS proxy in front of the server for that, and keep
+  `WEB_DESKTOP_ADDR` on loopback while you do.
+* **Signing out clears the cookie, it does not revoke it.** The session is stateless —
+  the cookie carries nothing but its own expiry — so *Sign out* tells your browser to
+  forget it immediately, while a copy someone else already made would keep working until
+  it expires. Nothing records a login that could be struck off, which is the price of
+  having no session table; shorten `WEB_DESKTOP_SESSION_DAYS` if that matters to you.
+* **It is not a rate limiter either.** bcrypt makes each guess cost ~250 ms of server
+  CPU, which turns online guessing into a slow, loud affair, but a serious exposure
+  wants fail2ban or a proxy in front as well.
+
+Settings shows the current state, and the *Sign out* button there ends the session and
+closes every window.
 
 ## Adding a program
 

@@ -15,6 +15,15 @@
 //! directory and its parents (so running from the workspace root finds the same one
 //! `cargo run` does).
 //!
+//!   WEB_DESKTOP_PASSWORD_HASH
+//!                     bcrypt hash of the password every visit must type. Unset means
+//!                     no login at all, which is the default. Generate one with
+//!                     `cargo xtask hash-password`.
+//!   WEB_DESKTOP_SECRET
+//!                     the key session cookies are signed with. Unset means a random
+//!                     key each start, so sessions end when the server does.
+//!   WEB_DESKTOP_SESSION_DAYS
+//!                     how long a signed-in browser stays signed in, default 7
 //!   WEB_DESKTOP_ADDR  listen address, default 127.0.0.1:8080
 //!   WEB_DESKTOP_ROOT  directory the file browser may read, default ~/web-desktop
 //!   WEB_DESKTOP_FS    set to `off` to disable the filesystem API entirely
@@ -63,6 +72,7 @@
 
 mod ai;
 mod apps;
+mod auth;
 mod fs;
 mod images;
 mod provider;
@@ -76,9 +86,10 @@ use axum::{
     http::{HeaderValue, header},
     middleware::{self, Next},
     response::Response,
-    routing::get,
+    routing::{get, post},
 };
 use shared::{API_CATALOG, API_HEALTH, Catalog, Health, default_catalog};
+use shared::{API_LOGIN, API_LOGOUT, API_SESSION};
 use tower_http::{compression::CompressionLayer, services::ServeDir, trace::TraceLayer};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -99,6 +110,8 @@ pub struct AppState {
     /// Image gateway; `None` when no image provider URL is configured. Separate from
     /// [`Self::ai`] because the two may be different services on different keys.
     images: Option<images::Images>,
+    /// Password login; `None` when no password hash is configured.
+    auth: Option<auth::Auth>,
     /// `None` when the filesystem API is switched off or its root is unusable.
     fs: Option<FsRoot>,
 }
@@ -209,6 +222,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Password login. Disabled unless a hash is configured, so existing deployments
+    // keep working without any change. The hash is bcrypt; a helper command generates it.
+    let auth = auth::Auth::from_env();
+    if auth.is_some() {
+        tracing::info!("auth: password login enabled");
+    } else {
+        tracing::info!(
+            "auth off: set WEB_DESKTOP_PASSWORD_HASH=$(cargo xtask hash-password) to require a login"
+        );
+    }
+
     // Served apps are appended to the compiled-in ones. They live under
     // /apps/<id>/<version>/, which is immutable, so the cache policy can treat
     // everything there as content-addressed.
@@ -257,9 +281,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ai,
         images,
         fs: fs_root,
+        auth,
     });
 
-    let api = Router::new()
+    // Everything in `protected` needs a session, once one is configured. The login
+    // endpoints are deliberately outside it: they are how a session is obtained.
+    let protected = Router::new()
         .route(API_HEALTH, get(health))
         .route(API_CATALOG, get(catalog_handler))
         .merge(fs::router())
@@ -272,7 +299,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             shared::API_PROXY,
             get(proxy::get).route_layer(middleware::from_fn(fs::same_origin)),
         )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ))
         .with_state(state.clone());
+
+    let api = Router::new()
+        .route(API_SESSION, get(auth::session))
+        .route(API_LOGIN, post(auth::login))
+        .route(API_LOGOUT, post(auth::logout))
+        .with_state(state.clone())
+        .merge(protected);
 
     // App bundles: plain static files, so `ServeDir` handles ranges, MIME types
     // (it knows .wasm and .js) and path traversal, and picks up precompressed
@@ -321,6 +359,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (SVG is an exception), gRPC, SSE and bodies under 32 bytes, and it skips
     // responses that already carry a `content-encoding`, so precompressed assets
     // are not encoded twice.
+    // Cookie parsing must happen before any handler or middleware that reads cookies.
+    .layer(auth::cookie_layer())
     .layer(CompressionLayer::new())
     .layer(middleware::from_fn(cache_policy))
     .layer(TraceLayer::new_for_http());

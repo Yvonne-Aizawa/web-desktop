@@ -8,8 +8,11 @@
 use serde::{Deserialize, Serialize};
 
 pub mod ai;
+pub mod auth;
 pub mod fs;
 pub mod image;
+
+pub use auth::{API_LOGIN, API_LOGOUT, API_SESSION};
 
 /// Interface version between the shell and a served app.
 ///

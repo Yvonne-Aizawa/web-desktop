@@ -833,6 +833,7 @@ mod tests {
             ai: None,
             images: Some(images),
             fs: None,
+            auth: None,
         })
     }
 
@@ -928,6 +929,7 @@ mod tests {
             ai: None,
             images: None,
             fs: None,
+            auth: None,
         });
 
         let err = generate(State(state.clone()), Json(request(None)))

@@ -8,6 +8,8 @@
 //!                       manifest that carries its hash, size and ABI version
 //!   e2e [options]       build everything, then drive a real browser through the
 //!                       suite in `crates/e2e` (see that directory's README)
+//!   hash-password       read a password from stdin and print the bcrypt hash for
+//!                       `WEB_DESKTOP_PASSWORD_HASH`
 //!
 //! Kept out of the server and the client on purpose: `brotli`, `flate2` and `sha2`
 //! are build-time concerns, and `wasm-bindgen`/`wasm-opt` are binaries we only need
@@ -50,12 +52,14 @@ fn main() {
             None => Err("usage: cargo xtask build-app <crate-dir>".to_owned()),
         },
         Some("e2e") => e2e(&args[1..]),
+        Some("hash-password") => hash_password(),
         Some(other) => Err(format!("unknown command `{other}`")),
         None => {
             eprintln!(
                 "usage:\n  \
                  cargo xtask precompress [dir]\n  \
                  cargo xtask build-app <crate-dir>\n  \
+                 cargo xtask hash-password\n  \
                  cargo xtask e2e [--list] [--only name,name] [--no-build] [--keep] [--skip-network]"
             );
             std::process::exit(2);
@@ -452,6 +456,36 @@ fn ensure_venv(work: &Path, suite: &Path) -> Result<PathBuf, String> {
         )?;
     }
     Ok(python)
+}
+
+// ------------------------------------------------------------- hash-password
+
+/// Turn a password into the bcrypt hash `WEB_DESKTOP_PASSWORD_HASH` wants.
+///
+/// The password is read from stdin rather than taken as an argument: arguments end up
+/// in shell history and in `ps` output, and this is the one secret the operator types.
+/// Only the hash goes to stdout, so
+/// `WEB_DESKTOP_PASSWORD_HASH=$(cargo xtask hash-password)` works as written.
+fn hash_password() -> Result<(), String> {
+    use std::io::{BufRead, Write};
+
+    eprint!("password: ");
+    std::io::stderr().flush().map_err(|e| e.to_string())?;
+    let mut line = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .map_err(|e| e.to_string())?;
+    let password = line.trim_end_matches(['\n', '\r']);
+    if password.is_empty() {
+        return Err("no password given".to_owned());
+    }
+
+    // The crate's default cost (12) on purpose: this runs once, and the cost is what
+    // makes guessing over HTTP pointless.
+    let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST).map_err(|e| e.to_string())?;
+    println!("{hash}");
+    Ok(())
 }
 
 fn run(command: &mut Command, what: &str) -> Result<(), String> {

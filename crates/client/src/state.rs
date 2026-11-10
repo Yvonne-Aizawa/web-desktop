@@ -36,6 +36,29 @@ pub struct OpenRequest {
     pub path: String,
 }
 
+/// Where the shell stands with the server's password login.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AuthState {
+    /// The session has not been asked about yet. Treated as "let them in": the shell
+    /// boots from its compiled-in defaults, and a locked server says so a moment later.
+    #[default]
+    Checking,
+    /// A password is configured and this browser has no valid session: show the login
+    /// screen and ask for one before anything else is fetched.
+    Locked,
+    /// Signed in.
+    Unlocked,
+    /// No password is configured on the server.
+    Disabled,
+}
+
+impl AuthState {
+    /// Whether the login screen should be up.
+    pub fn is_locked(self) -> bool {
+        self == Self::Locked
+    }
+}
+
 /// Handle to an app in the shell's registry.
 ///
 /// A small index rather than the manifest itself, because [`WinData`] has to stay
@@ -120,6 +143,12 @@ pub struct Desktop {
     /// What the backend's image gateway offers: which models and sizes it accepts.
     /// Empty `models` means no image provider is configured there.
     pub images: RwSignal<ImageInfo>,
+    /// Whether the server wants a password, and whether it has been given one.
+    pub auth: RwSignal<AuthState>,
+    /// Why the last sign-in attempt failed, shown under the password box.
+    pub login_error: RwSignal<Option<String>>,
+    /// A sign-in is in flight; the button says so and refuses a second click.
+    pub login_busy: RwSignal<bool>,
     pub start_open: RwSignal<bool>,
     /// A file handed to an app, as `(which app, which path)`.
     ///
@@ -156,6 +185,9 @@ impl Desktop {
             proxy: RwSignal::new(ProxyInfo::default()),
             ai: RwSignal::new(fallback.ai),
             images: RwSignal::new(fallback.images),
+            auth: RwSignal::new(AuthState::Checking),
+            login_error: RwSignal::new(None),
+            login_busy: RwSignal::new(false),
             start_open: RwSignal::new(false),
             pending_open: RwSignal::new(None),
             health: RwSignal::new(None),
@@ -392,6 +424,72 @@ impl Desktop {
         });
     }
 
+    /// Start the shell: ask whether a password is needed, and only then fetch anything.
+    ///
+    /// The order matters. A locked server answers every other endpoint with a 401, so
+    /// asking the catalog first would fill Settings with failures and, worse, mean the
+    /// shell had already tried to read the user's files. One session check first costs
+    /// a round trip and keeps the login screen honest.
+    pub fn bootstrap(self) {
+        self.auth.set(AuthState::Checking);
+        wasm_bindgen_futures::spawn_local(async move {
+            let state = match crate::api::fetch_session().await {
+                Ok(session) if !session.enabled => AuthState::Disabled,
+                Ok(session) if session.authenticated => AuthState::Unlocked,
+                Ok(_) => AuthState::Locked,
+                // Unreachable server: no session to obtain, and `refresh` will report
+                // the failure in Settings and the tray. The shell stays usable offline.
+                Err(_) => AuthState::Disabled,
+            };
+            self.auth.set(state);
+            if !state.is_locked() {
+                self.refresh();
+            }
+        });
+    }
+
+    /// Try a password and, if it is right, load everything the login screen was
+    /// standing in front of.
+    pub fn sign_in(self, password: String) {
+        if self.login_busy.get_untracked() {
+            return;
+        }
+        self.login_busy.set(true);
+        self.login_error.set(None);
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = crate::api::login(&password).await;
+            // Drop the plaintext as soon as the request is away; nothing keeps it.
+            drop(password);
+            self.login_busy.set(false);
+            match result {
+                Ok(response) if response.ok => {
+                    self.auth.set(AuthState::Unlocked);
+                    self.refresh();
+                }
+                Ok(_) => self
+                    .login_error
+                    .set(Some("That password was not accepted.".to_owned())),
+                Err(err) => self.login_error.set(Some(err)),
+            }
+        });
+    }
+
+    /// End the session and put the login screen back.
+    ///
+    /// Windows are closed first: they hold the user's files and conversations, and a
+    /// login screen in front of an open editor is not the same as being signed out.
+    pub fn sign_out(self) {
+        wasm_bindgen_futures::spawn_local(async move {
+            // The cookie is cleared server-side; a failure here still locks the UI, and
+            // the next `bootstrap` will find out the truth.
+            let _ = crate::api::logout().await;
+            self.close_all();
+            self.start_open.set(false);
+            self.auth.set(AuthState::Locked);
+            self.login_error.set(None);
+        });
+    }
+
     /// Pull the catalog and health payload from the axum backend.
     ///
     /// The shell stays usable if this fails: `new()` already seeded the catalog
@@ -422,12 +520,31 @@ impl Desktop {
                 Err(err) => {
                     self.catalog_error.set(Some(err.clone()));
                     self.health.set(Some(Err(err)));
+                    // An expired session looks exactly like any other failure from here:
+                    // a 401 is just an error string by the time it reaches the UI. Ask
+                    // the one endpoint that can tell the difference, so a session that
+                    // ran out while the tab was open gets the login screen back rather
+                    // than a desktop where every click fails.
+                    self.recheck_session();
                 }
             }
 
             match crate::api::fetch_health().await {
                 Ok(health) => self.health.set(Some(Ok(health))),
                 Err(err) => self.health.set(Some(Err(err))),
+            }
+        });
+    }
+
+    /// Whether this browser still has a session, for the case where a request failed
+    /// for no visible reason.
+    fn recheck_session(self) {
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(session) = crate::api::fetch_session().await {
+                if session.enabled && !session.authenticated {
+                    self.close_all();
+                    self.auth.set(AuthState::Locked);
+                }
             }
         });
     }

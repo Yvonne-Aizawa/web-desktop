@@ -10,6 +10,7 @@
 mod api;
 mod apps;
 mod format;
+mod login;
 mod runtime;
 mod start_menu;
 mod state;
@@ -18,6 +19,7 @@ mod window;
 
 use leptos::prelude::*;
 
+use crate::login::LoginScreen;
 use crate::start_menu::StartMenu;
 use crate::state::Desktop;
 use crate::taskbar::Taskbar;
@@ -28,33 +30,39 @@ fn App() -> impl IntoView {
     let desktop = Desktop::new();
     provide_context(desktop);
 
-    // Bootstrap from the backend once, then keep going whether or not it answered.
-    Effect::new(move |_| desktop.refresh());
+    // Ask whether this server wants a password before fetching anything, then keep
+    // going whether or not it answered.
+    Effect::new(move |_| desktop.bootstrap());
 
     let background = move || format!("background:{};", desktop.wallpaper.get());
 
     view! {
         <div class="desktop" style=background>
-            <main class="window-layer">
-                <For each=move || desktop.windows.get() key=|w| w.id let:item>
-                    {
-                        let live = desktop.live(item.id, item);
-                        view! { <WindowFrame id=item.id app=item.app live=live /> }
-                    }
-                </For>
+            <Show
+                when=move || !desktop.auth.get().is_locked()
+                fallback=move || view! { <LoginScreen /> }
+            >
+                <main class="window-layer">
+                    <For each=move || desktop.windows.get() key=|w| w.id let:item>
+                        {
+                            let live = desktop.live(item.id, item);
+                            view! { <WindowFrame id=item.id app=item.app live=live /> }
+                        }
+                    </For>
 
-                <Show when=move || desktop.windows.get().is_empty()>
-                    <div class="empty-hint">
-                        <div class="hint-mark">"▚"</div>
-                        <h1>"Web Desktop"</h1>
-                        <p>"Rust all the way down: axum serves the API, leptos renders this shell."</p>
-                        <p class="muted">"Open the Start menu to launch a window."</p>
-                    </div>
-                </Show>
-            </main>
+                    <Show when=move || desktop.windows.get().is_empty()>
+                        <div class="empty-hint">
+                            <div class="hint-mark">"▚"</div>
+                            <h1>"Web Desktop"</h1>
+                            <p>"Rust all the way down: axum serves the API, leptos renders this shell."</p>
+                            <p class="muted">"Open the Start menu to launch a window."</p>
+                        </div>
+                    </Show>
+                </main>
 
-            <StartMenu />
-            <Taskbar />
+                <StartMenu />
+                <Taskbar />
+            </Show>
         </div>
     }
 }

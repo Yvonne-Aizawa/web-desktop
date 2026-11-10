@@ -2,6 +2,9 @@
 
 use gloo_net::http::{Request, Response};
 use serde::de::DeserializeOwned;
+use shared::auth::{
+    API_LOGIN, API_LOGOUT, API_SESSION, LoginRequest, LoginResponse, SessionResponse,
+};
 use shared::fs::{
     API_FS_CONTENT, API_FS_DELETE, API_FS_DIR, API_FS_DOWNLOAD, API_FS_ENTRY, API_FS_LIST,
     API_FS_PREVIEW, API_FS_RAW, API_FS_TRASH, API_FS_TRASH_RESTORE, ApiError, DirListing,
@@ -17,6 +20,37 @@ pub async fn fetch_catalog() -> Result<Catalog, String> {
 
 pub async fn fetch_health() -> Result<Health, String> {
     get_json(API_HEALTH).await
+}
+
+// ------------------------------------------------------------------ account
+
+/// Whether this browser has a session, and whether the server wants one.
+///
+/// Called before anything else on boot: a locked server has no catalog to show, so
+/// the shell asks this first rather than failing every other request with a 401.
+pub async fn fetch_session() -> Result<SessionResponse, String> {
+    get_json(API_SESSION).await
+}
+
+/// Try a password. `Ok(LoginResponse { ok: false })` is a wrong password, which is a
+/// normal answer rather than an error; `Err` means the request itself failed.
+pub async fn login(password: &str) -> Result<LoginResponse, String> {
+    let body = LoginRequest {
+        password: password.to_owned(),
+    };
+    let request = Request::post(API_LOGIN)
+        .json(&body)
+        .map_err(|err| format!("could not build the request: {err}"))?;
+    send(request).await
+}
+
+/// End the session. The server also expires the cookie, so this works even if the
+/// answer is lost.
+pub async fn logout() -> Result<(), String> {
+    let request = Request::post(API_LOGOUT)
+        .build()
+        .map_err(|err| format!("could not build the request: {err}"))?;
+    send_empty(request).await
 }
 
 /// List one directory inside the file browser root.

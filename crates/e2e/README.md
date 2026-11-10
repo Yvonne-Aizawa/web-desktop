@@ -64,6 +64,7 @@ is no `.env`, so your local configuration cannot make the suite pass or fail.
 | `proxy` | `probe_proxy.py` | the outbound proxy: allowed host, CORS-free fetch, refusal | 4 |
 | `trash` | `probe_trash.py` | delete, undo, trash view, restore, delete forever, empty | 28 |
 | `readonly` | `probe_readonly.py` | a root served with writes switched off | 9 |
+| `auth` | `probe_auth.py` | the login screen: a locked server, a wrong password, a right one, signing out | 24 |
 | `pokedex` | `probe_pokedex.py` | the Pokédex app fetching through the proxy (needs the internet) | 11 |
 
 ## Status, honestly
@@ -71,7 +72,7 @@ is no `.env`, so your local configuration cannot make the suite pass or fail.
 The suite was rebuilt after `/tmp` was wiped by a reboot, from the session transcripts
 (so the probes are the real ones, recovered rather than rewritten). Against `HEAD`:
 
-* **Every scenario is green**: 307 checks across 18 scenarios, a couple of minutes at the
+* **Every scenario is green**: 331 checks across 19 scenarios, a couple of minutes at the
   default `--jobs 4`. `pokedex` is the only one that needs the internet; `--skip-network`
   skips it rather than failing it.
 * `run.py` reports a scenario as `crashed` rather than `ok` when a probe dies part-way,

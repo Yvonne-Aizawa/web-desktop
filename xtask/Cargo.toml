@@ -11,6 +11,10 @@ shared.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+# `hash-password` hashes with the same algorithm the server verifies with, so the two
+# cannot drift apart.
+bcrypt = "0.17"
+
 # Build-time only: precompressing assets and packaging served apps.
 brotli = "8"
 flate2 = "1"

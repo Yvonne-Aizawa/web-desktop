@@ -4,7 +4,7 @@ use leptos::prelude::*;
 use shared::AppId;
 
 use crate::format::human_size;
-use crate::state::Desktop;
+use crate::state::{AuthState, Desktop};
 
 #[component]
 pub fn Settings() -> impl IntoView {
@@ -230,6 +230,45 @@ pub fn Settings() -> impl IntoView {
                     <p class="muted">
                         "Separately configured from the chat gateway, so the two can be different providers on different keys. A model and a size are both a bill, so the server refuses anything outside the lists above."
                     </p>
+                </Show>
+            </section>
+
+            <section class="pane">
+                <h3>"Account"</h3>
+                <Show
+                    when=move || desktop.auth.get() != AuthState::Disabled
+                    fallback=move || {
+                        view! {
+                            <div class="kv">
+                                <span>"status"</span>
+                                <span class="badge badge-wait">"off"</span>
+                            </div>
+                            <p class="muted">
+                                "This server lets anyone who can reach it in. Set a password to change that:"
+                            </p>
+                            <p class="path-value">
+                                "WEB_DESKTOP_PASSWORD_HASH=$(cargo xtask hash-password)"
+                            </p>
+                        }
+                    }
+                >
+                    <div class="kv">
+                        <span>"status"</span>
+                        <Show
+                            when=move || desktop.auth.get() == AuthState::Unlocked
+                            fallback=move || {
+                                view! { <span class="badge badge-wait">"locked"</span> }
+                            }
+                        >
+                            <span class="badge badge-ok">"signed in"</span>
+                        </Show>
+                    </div>
+                    <p class="muted">
+                        "The password lives on the server as a bcrypt hash and is never sent to the browser. Sessions are signed HTTP-only cookies; set WEB_DESKTOP_SECRET so they survive a restart."
+                    </p>
+                    <button class="ghost-btn" on:click=move |_| desktop.sign_out()>
+                        "Sign out"
+                    </button>
                 </Show>
             </section>
 

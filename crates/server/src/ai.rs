@@ -652,6 +652,7 @@ mod tests {
             fs: None,
             ai: Some(ai),
             images: None,
+            auth: None,
         })
     }
 
@@ -750,6 +751,7 @@ mod tests {
             fs: None,
             ai: None,
             images: None,
+            auth: None,
         });
 
         let err = chat(State(state.clone()), Json(request(None, false)))

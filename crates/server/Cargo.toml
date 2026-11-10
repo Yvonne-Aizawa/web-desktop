@@ -16,6 +16,10 @@ serde_json.workspace = true
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tower-http = { version = "0.6", features = ["fs", "trace", "compression-gzip", "compression-br"] }
+tower-cookies = { version = "0.11", features = ["signed"] }
+cookie = { version = "0.18", features = ["signed", "key-expansion"] }
+bcrypt = "0.17"
+sha2 = "0.10"
 # Streaming responses (raw images and downloads) instead of buffering whole files.
 tokio-util = { version = "0.7", features = ["io"] }
 # The outbound proxy. rustls so the server needs no system TLS library.
