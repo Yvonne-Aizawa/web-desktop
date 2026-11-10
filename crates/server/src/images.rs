@@ -18,12 +18,15 @@
 //! * **The models and the sizes are allow-lists.** They are the two things a caller can
 //!   choose, and both are a bill — a larger image costs more — so both are bounded by
 //!   configuration. The count is capped at what the provider itself accepts.
+//! * **Reference images for img2img are bounded and checked.** This is the one place a
+//!   caller supplies file content rather than a name, so the number, each size, the total,
+//!   the base64 shape and the file signature are all checked before anything is forwarded.
 //! * **The key is the server's.** Read from the environment, never logged, never sent to
 //!   the browser and never in the catalog payload.
 //! * **Off until asked for.** An unset `WEB_DESKTOP_IMAGE_URL` means the endpoint
 //!   answers "off" and names the variable to set, rather than 404ing.
-//! * Bounded: prompt length in, a body ceiling out, a concurrency cap, and one timeout
-//!   for the whole generation.
+//! * Bounded: prompt length in, reference images checked, a body ceiling out, a
+//!   concurrency cap, and one timeout for the whole generation.
 //!
 //! What it adds on the way through: the provider returns base64 and never says which
 //! format it produced, so the server sniffs the first bytes and reports a MIME type. That
@@ -34,7 +37,7 @@ use std::{sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::StatusCode,
     middleware,
     response::{IntoResponse, Response},
@@ -45,7 +48,7 @@ use shared::{
     fs::ApiError,
     image::{
         API_IMAGE_GENERATE, API_IMAGE_INFO, DEFAULT_SIZES, GeneratedImage, ImageInfo, ImageRequest,
-        ImageResponse, MAX_COUNT,
+        ImageResponse, MAX_COUNT, MAX_INPUT_IMAGES, accepts_input_mime,
     },
 };
 use tokio::sync::Semaphore;
@@ -56,6 +59,21 @@ use crate::{AppState, fs::same_origin, provider};
 pub const MAX_PROMPT_CHARS: usize = 4_000;
 /// Characters in an `avoid` list, or in one of the short option strings.
 const MAX_OPTION_CHARS: usize = 512;
+/// Largest reference image, decoded. Well above a `1024x1024` PNG; it exists for the
+/// photograph someone actually wants to restyle.
+const MAX_INPUT_BYTES: usize = 6 * 1024 * 1024;
+/// Largest total across all reference images, decoded.
+const MAX_INPUT_TOTAL: usize = 12 * 1024 * 1024;
+/// Largest request body this router accepts.
+///
+/// Axum's default is 2 MiB, which one reference image blows through, so the images router
+/// raises it explicitly. Four images at [`MAX_INPUT_BYTES`] are about 16 MiB once base64
+/// has added its third, which is what this leaves room for.
+const MAX_REQUEST_BYTES: usize = 20 * 1024 * 1024;
+/// Most diffusion steps a request may ask for. Past a point more steps is only slower.
+const MAX_STEPS: u32 = 150;
+/// Largest guidance scale a request may ask for.
+const MAX_GUIDANCE: f32 = 30.0;
 /// Largest provider body read. One `1024x1024` PNG is a few hundred KB of base64, and
 /// the provider takes up to ten of them; this leaves room without being unbounded.
 const MAX_PROVIDER_BYTES: usize = 64 * 1024 * 1024;
@@ -260,6 +278,9 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route(API_IMAGE_INFO, get(info))
         .route(API_IMAGE_GENERATE, post(generate))
+        // A body of reference images is megabytes of base64, so the images router raises
+        // axum's 2 MiB default explicitly rather than failing on the first photograph.
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         // The same guard the file API, the proxy and the chat gateway carry: this
         // endpoint spends the operator's key and money, so a random page must not be
         // able to cause a request.
@@ -312,6 +333,20 @@ async fn generate(
     }
     if let Some(seed) = request.seed {
         object.insert("seed".to_owned(), serde_json::Value::from(seed));
+    }
+    // The reference images that make this img2img rather than text-to-image. Sent as the
+    // bare base64 the provider documents, not as `data:` URLs.
+    if !request.input_images.is_empty() {
+        object.insert(
+            "input_images".to_owned(),
+            serde_json::Value::from(request.input_images.clone()),
+        );
+    }
+    if let Some(steps) = request.steps {
+        object.insert("steps".to_owned(), serde_json::Value::from(steps));
+    }
+    if let Some(guidance) = request.guidance {
+        object.insert("guidance".to_owned(), serde_json::Value::from(guidance));
     }
 
     // A slot is taken before the request goes out and held until the answer is read, so
@@ -434,7 +469,103 @@ fn validate(request: &ImageRequest) -> Result<&str, ImageError> {
             )));
         }
     }
+    if request
+        .steps
+        .is_some_and(|steps| steps == 0 || steps > MAX_STEPS)
+    {
+        return Err(ImageError::BadRequest(format!(
+            "`steps` must be between 1 and {MAX_STEPS}"
+        )));
+    }
+    if request
+        .guidance
+        .is_some_and(|guidance| !guidance.is_finite() || !(0.0..=MAX_GUIDANCE).contains(&guidance))
+    {
+        return Err(ImageError::BadRequest(format!(
+            "`guidance` must be between 0 and {MAX_GUIDANCE}"
+        )));
+    }
+    validate_references(&request.input_images)?;
     Ok(prompt)
+}
+
+/// Check the img2img reference images before any of them is forwarded.
+///
+/// The one thing a caller controls here is file *content* — megabytes of base64 that the
+/// server hands to the provider — so this is the boundary that bounds it: how many, how
+/// big each, how big in total, and that each one really is a raster image rather than
+/// arbitrary bytes wearing a reference's clothes.
+fn validate_references(images: &[String]) -> Result<(), ImageError> {
+    if images.len() > MAX_INPUT_IMAGES {
+        return Err(ImageError::BadRequest(format!(
+            "{} reference images; the limit is {MAX_INPUT_IMAGES}",
+            images.len()
+        )));
+    }
+
+    let mut total = 0usize;
+    for (index, data) in images.iter().enumerate() {
+        let number = index + 1;
+        let Some(decoded) = base64_len(data) else {
+            return Err(ImageError::BadRequest(format!(
+                "reference image {number} is not base64"
+            )));
+        };
+        if decoded > MAX_INPUT_BYTES {
+            return Err(ImageError::BadRequest(format!(
+                "reference image {number} is {} MiB decoded; the limit is {} MiB",
+                decoded / (1024 * 1024),
+                MAX_INPUT_BYTES / (1024 * 1024)
+            )));
+        }
+        total += decoded;
+        if total > MAX_INPUT_TOTAL {
+            return Err(ImageError::BadRequest(format!(
+                "the reference images total more than {} MiB decoded",
+                MAX_INPUT_TOTAL / (1024 * 1024)
+            )));
+        }
+        let mime = sniff_mime(data);
+        if !accepts_input_mime(mime) {
+            return Err(ImageError::BadRequest(format!(
+                "reference image {number} is not a PNG, JPEG or WebP"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The decoded length of a base64 body, or `None` when it is not base64 at all.
+///
+/// A validator rather than a decoder: the server never needs the reference image's bytes,
+/// only its size and its first few, and the first few are readable straight off the base64
+/// prefix (see [`sniff_mime`]). What it has to be sure of is that the string is something
+/// the provider will accept, so it checks the alphabet and the length and stops there.
+fn base64_len(data: &str) -> Option<usize> {
+    // The smallest base64 group is four characters, and every group is four.
+    if data.len() < 4 || !data.len().is_multiple_of(4) {
+        return None;
+    }
+
+    let bytes = data.as_bytes();
+    let mut padding = 0usize;
+    for byte in bytes {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' => {
+                // Anything after the padding means the `=` was not at the end.
+                if padding > 0 {
+                    return None;
+                }
+            }
+            b'=' => padding += 1,
+            _ => return None,
+        }
+        if padding > 2 {
+            return None;
+        }
+    }
+
+    Some(data.len() / 4 * 3 - padding)
 }
 
 /// Which image format a base64 body holds, from its leading bytes.
@@ -610,6 +741,22 @@ mod tests {
                         r#"{"created":1,"data":[]}"#,
                     )
                         .into_response(),
+                    "img2img" => {
+                        // The whole point of the mode: what the app sent as a reference
+                        // and as model extras arrived at the provider unchanged.
+                        assert_eq!(body["input_images"][0], TINY_PNG);
+                        assert_eq!(body["steps"], 20);
+                        assert_eq!(body["guidance"], 3.5);
+                        (
+                            [(header::CONTENT_TYPE, "application/json")],
+                            serde_json::json!({
+                                "created": 1,
+                                "data": [{"b64_json": TINY_PNG}],
+                            })
+                            .to_string(),
+                        )
+                            .into_response()
+                    }
                     "policy" => (
                         StatusCode::BAD_REQUEST,
                         [(header::CONTENT_TYPE, "application/json")],
@@ -804,5 +951,95 @@ mod tests {
     fn the_prompt_comes_back_trimmed() {
         let request = ImageRequest::new("  a ship  ");
         assert_eq!(validate(&request).unwrap(), "a ship");
+    }
+
+    #[tokio::test]
+    async fn reference_images_and_the_model_extras_reach_the_provider() {
+        let base = fake_provider("img2img").await;
+        let state = state_with(gateway(&base, "sd", &["sd"]));
+
+        let mut request = ImageRequest::new("make it dusk");
+        request.input_images = vec![TINY_PNG.to_owned()];
+        request.steps = Some(20);
+        request.guidance = Some(3.5);
+
+        let Json(answer) = generate(State(state), Json(request)).await.unwrap();
+        assert_eq!(answer.images.len(), 1);
+    }
+
+    #[test]
+    fn a_reference_that_is_not_an_image_is_refused_before_anything_is_sent() {
+        let mut request = ImageRequest::new("a ship");
+
+        // Not base64 at all.
+        request.input_images = vec!["not base64!".to_owned()];
+        assert!(matches!(validate(&request), Err(ImageError::BadRequest(_))));
+
+        // Valid base64, but the bytes are `hi` rather than a picture.
+        request.input_images = vec!["aGk=".to_owned()];
+        let err = validate(&request).unwrap_err();
+        assert!(err.message().contains("not a PNG"), "{}", err.message());
+
+        // A GIF is an image, and still not one of the formats the models take.
+        request.input_images = vec!["R0lGODlhAQABAAAAACw=".to_owned()];
+        assert!(matches!(validate(&request), Err(ImageError::BadRequest(_))));
+    }
+
+    #[test]
+    fn too_many_reference_images_or_a_silly_extras_value_is_refused() {
+        let mut request = ImageRequest::new("a ship");
+        request.input_images = vec![TINY_PNG.to_owned(); MAX_INPUT_IMAGES + 1];
+        let err = validate(&request).unwrap_err();
+        assert!(
+            err.message().contains("reference images"),
+            "{}",
+            err.message()
+        );
+
+        request.input_images = vec![TINY_PNG.to_owned()];
+        request.steps = Some(0);
+        assert!(matches!(validate(&request), Err(ImageError::BadRequest(_))));
+        request.steps = Some(MAX_STEPS + 1);
+        assert!(matches!(validate(&request), Err(ImageError::BadRequest(_))));
+        request.steps = Some(20);
+
+        request.guidance = Some(-1.0);
+        assert!(matches!(validate(&request), Err(ImageError::BadRequest(_))));
+        request.guidance = Some(f32::NAN);
+        assert!(matches!(validate(&request), Err(ImageError::BadRequest(_))));
+        request.guidance = Some(3.5);
+        assert!(validate(&request).is_ok());
+    }
+
+    #[test]
+    fn a_reference_larger_than_the_cap_is_refused() {
+        // `iVBORw0KGgoA` is the PNG signature in base64 and is a whole number of groups,
+        // so appending `A`s keeps it valid base64 and keeps the signature at the front.
+        // Base64 is four characters per three bytes, so this is what it takes to decode
+        // to more than the cap rather than exactly to it.
+        let chars = MAX_INPUT_BYTES / 3 * 4 + 4;
+        assert!(
+            chars.is_multiple_of(4),
+            "the constructed body has to be valid base64"
+        );
+        let oversize = format!("iVBORw0KGgoA{}", "A".repeat(chars));
+        let request = ImageRequest::new("a ship").with_input_images(vec![oversize]);
+        let err = validate(&request).unwrap_err();
+        assert!(err.message().contains("MiB decoded"), "{}", err.message());
+    }
+
+    #[test]
+    fn the_base64_shapes_that_are_not_base64_are_caught() {
+        assert_eq!(base64_len("AAAA"), Some(3));
+        // One byte of payload, two padding characters.
+        assert_eq!(base64_len("aGk="), Some(2));
+        assert_eq!(base64_len("aGk"), None, "length is not a multiple of four");
+        assert_eq!(base64_len("AAA"), None);
+        assert_eq!(base64_len(""), None);
+        assert_eq!(base64_len("===="), None, "nothing but padding");
+        assert_eq!(base64_len("AA=="), Some(1));
+        assert_eq!(base64_len("A==="), None, "three padding characters");
+        assert_eq!(base64_len("AA=A"), None, "data after the padding");
+        assert_eq!(base64_len("AA-A"), None, "a character outside the alphabet");
     }
 }

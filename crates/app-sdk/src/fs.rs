@@ -89,6 +89,34 @@ pub async fn write_bytes(path: &str, bytes: &[u8], content_type: &str) -> Result
     send(request).await
 }
 
+/// Read a file's raw bytes.
+///
+/// The same bytes [`download_url`] hands a browser as an attachment, read into memory
+/// instead of saved. Capped by the server at 64 MiB, which is why a caller that only
+/// wants a reference image should check what it is reading first.
+pub async fn read_bytes(path: &str) -> Result<Vec<u8>, String> {
+    let request = Request::get(&download_url(path))
+        .build()
+        .map_err(|err| format!("could not build the request: {err}"))?;
+    let response = request
+        .send()
+        .await
+        .map_err(|err| format!("request failed: {err}"))?;
+
+    let status = response.status();
+    if !(200..300).contains(&status) {
+        return Err(response
+            .json::<ApiError>()
+            .await
+            .map(|body| body.error)
+            .unwrap_or_else(|_| format!("HTTP {status}")));
+    }
+    response
+        .binary()
+        .await
+        .map_err(|err| format!("reading the file: {err}"))
+}
+
 /// Create a directory inside `parent`.
 pub async fn create_dir(parent: &str, name: &str) -> Result<FsEntry, String> {
     let body = shared::fs::FsMutation {

@@ -620,10 +620,14 @@ app ──POST /api/images/generate──▶ server ──POST {WEB_DESKTOP_IMAG
 | `WEB_DESKTOP_IMAGE_SIZES` | The `WxH` sizes an app may ask for. Defaults to the provider's documented set. |
 
 The fence is the chat gateway's, for the same reason — the caller never names an address
-— with two additions that are specific to a picture: **the size is an allow-list too**
-(a larger image is a larger bill), and **the count is capped** at what the provider
-itself accepts. The response ceiling is far higher than a chat's, because one base64 PNG
-is hundreds of kilobytes and a batch is megabytes.
+— with three additions specific to a picture: **the size is an allow-list too** (a larger
+image is a larger bill), **the count is capped** at what the provider itself accepts, and an
+img2img request's **reference images are bounded** — how many, how big each, how big in
+total, that each is really base64, and that the bytes behind it really start like a PNG, a
+JPEG or a WebP. That last one is the only place a caller supplies file *content* rather
+than a name, so it is checked rather than trusted. The response ceiling is far higher than
+a chat's, because one base64 PNG is hundreds of kilobytes and a batch is megabytes, and the
+request ceiling is raised past axum's 2 MiB default for the same reason.
 
 The one thing the server adds on the way through is a **sniffed MIME type**. The provider
 returns `b64_json` and never says which format it produced — FLUX hands back JPEG unless
@@ -646,10 +650,20 @@ past generation is one click away, and removing one is the ordinary trash, so Fi
 it back. The app offers the model, size, count and quality the server allows, and remembers
 what was chosen in `localStorage`.
 
-The request type is where image-to-image goes next: the provider documents `input_images`
-(base64 reference images) and the FLUX/SDXL extras (`steps`, `guidance`, `loras`) as
-top-level fields, and the server builds its body field by field, so each is one more
-explicit option rather than a passthrough map.
+**Image-to-image is the same app with a source attached.** *Use as source* in the viewer
+adds the picture on screen to a strip above the composer, and *+ source* opens a small
+browser over the sandbox — folders and the PNG/JPEG/WebP files in them — so a source can be
+anything in the user's files, not only what this app made. Reading one is `fs::read_bytes`
+and `image::encode_base64`, both of which are the browser's own `atob`/`btoa`; the sources
+are then sent as `input_images` and stay attached, so iterating on a picture is a prompt
+change and another click. The advanced row carries the other additions the provider
+documents: a negative prompt, `steps` and `guidance`, all read uncontrolled at Generate
+and all optional.
+
+The remaining model-specific fields (`width`/`height` as free sizes, `output_quality`, and
+the `lora_weights`/`lora_scale` pair) are the same kind of addition: the server builds its
+provider body field by field, so each is one more explicit option with its own bound rather
+than a passthrough map.
 
 ### Sample apps
 
@@ -851,11 +865,10 @@ That shape is load-bearing, so it is worth knowing why:
 * **No retry after a broken stream.** Text that arrived before a failure is kept and the
   failure is reported next to it, but the app does not try to pick the answer up where it
   stopped — the provider has no way to resume one.
-* **No image-to-image yet.** The Images app generates from a prompt only. The gateway is
-  shaped for the rest — the provider documents reference images and the FLUX/SDXL extras
-  as top-level fields — but the app has no way of picking a source picture and the server
-  does not yet bound one, which is what it must do before it accepts megabytes of
-  caller-supplied base64.
+* **No per-model control surface.** Images sends the fields the provider documents as
+  common to its img2img models — a negative prompt, `steps`, `guidance` — and none of the
+  model-specific rest (`width`/`height` free sizes, `output_quality`, LoRAs). A model that
+  wants those is used with its own defaults.
 
 Natural next steps: persist layout with `PUT /api/layout`, detect external edits by
 comparing mtime before saving, a WebSocket on a tokio `broadcast` channel to mirror

@@ -10,6 +10,10 @@
 //!   sandbox the Files app browses, named from the prompt with a timestamp so it sorts.
 //!   That is what makes the Gallery able to show it, Files able to rename or download
 //!   it, and the trash able to bring it back.
+//! * **An image can be the start of the next one.** A source picked from the sandbox is
+//!   read back, base64'd and sent as `input_images`, which is what makes this img2img
+//!   rather than text-to-image. The sidebar doubles as the picker, so a source can be one
+//!   of the pictures already here or anything else the user has put in their files.
 //!
 //! Two details carry over from the Chat app and are worth not rediscovering:
 //!
@@ -22,9 +26,9 @@
 //!   them is both, and the actions are plain functions taking one.
 
 use app_sdk::fs::{self, EntryKind, image_mime};
-use app_sdk::image::{ImageInfo, ImageRequest};
+use app_sdk::image::{ImageInfo, ImageRequest, MAX_INPUT_IMAGES, accepts_input_mime};
 use app_sdk::prelude::*;
-use leptos::html::Textarea;
+use leptos::html::{Input, Textarea};
 use leptos::task::spawn_local;
 use wasm_bindgen::JsValue;
 
@@ -67,6 +71,24 @@ struct Kept {
     name: String,
 }
 
+/// A reference image for img2img, already read and encoded.
+#[derive(Debug, Clone, PartialEq)]
+struct Source {
+    path: String,
+    name: String,
+    /// Base64 of the file's bytes, in the shape the gateway wants.
+    b64: String,
+}
+
+/// One row of the sidebar while it is browsing for a source.
+#[derive(Debug, Clone, PartialEq)]
+struct Pick {
+    name: String,
+    /// Root-relative path, which is also what opening it navigates to.
+    path: String,
+    dir: bool,
+}
+
 /// What the app is doing right now.
 #[derive(Debug, Clone, PartialEq)]
 enum Phase {
@@ -93,6 +115,14 @@ struct State {
     kept: RwSignal<Vec<Kept>>,
     /// A saved image being looked at, which replaces the batch on screen.
     viewing: RwSignal<Option<Kept>>,
+    /// Reference images for the next request, in the order they were picked.
+    sources: RwSignal<Vec<Source>>,
+    /// True while the sidebar is picking a source rather than listing `images/`.
+    browsing: RwSignal<bool>,
+    /// The directory the picker is showing, root-relative; `""` is the sandbox root.
+    dir: RwSignal<String>,
+    /// What that directory holds, folders first.
+    entries: RwSignal<Vec<Pick>>,
     /// One line of "that did not work", from the server or from the file API.
     notice: RwSignal<Option<String>>,
     credits: RwSignal<Option<f64>>,
@@ -185,7 +215,18 @@ async fn refresh(state: State) {
 /// The write is best-effort and per image: the picture is already the user's, and a
 /// read-only root has to show up in the footer rather than swallow it. A batch that
 /// cannot be saved still shows every image, because they were still paid for.
-fn generate(state: State, ctx: Context, composer: NodeRef<Textarea>) {
+///
+/// The three `NodeRef`s are the advanced inputs, read here rather than bound to signals
+/// so typing in them cannot move the caret; they are optional, and an empty one means the
+/// model's own default.
+fn generate(
+    state: State,
+    ctx: Context,
+    composer: NodeRef<Textarea>,
+    negative: NodeRef<Input>,
+    steps: NodeRef<Input>,
+    guidance: NodeRef<Input>,
+) {
     if state.phase.get_untracked() == Phase::Waiting || !state.info.get_untracked().enabled() {
         return;
     }
@@ -219,6 +260,32 @@ fn generate(state: State, ctx: Context, composer: NodeRef<Textarea>) {
         if !value.is_empty() {
             *slot = Some(value);
         }
+    }
+
+    // The sources are what make this img2img. They are kept after the request, so
+    // iterating on one picture is a prompt change and another click.
+    let sources = state.sources.get_untracked();
+    if !sources.is_empty() {
+        request.input_images = sources.into_iter().map(|source| source.b64).collect();
+    }
+
+    let text_of = |field: NodeRef<Input>| {
+        field
+            .get()
+            .map(|input| input.value())
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    };
+    let negative = text_of(negative);
+    if !negative.is_empty() {
+        request.negative_prompt = Some(negative);
+    }
+    if let Ok(value) = text_of(steps).parse::<u32>() {
+        request.steps = Some(value);
+    }
+    if let Ok(value) = text_of(guidance).parse::<f32>() {
+        request.guidance = Some(value);
     }
 
     spawn_local(async move {
@@ -276,6 +343,126 @@ fn generate(state: State, ctx: Context, composer: NodeRef<Textarea>) {
 /// Look at a saved image instead of the batch on screen.
 fn open_kept(state: State, kept: Kept) {
     state.viewing.set(Some(kept));
+}
+
+/// The directory above `dir`, as a root-relative path. `""` is the root, so the root has
+/// no parent to go to.
+fn parent(dir: &str) -> String {
+    dir.rsplit_once('/')
+        .map(|(above, _)| above.to_owned())
+        .unwrap_or_default()
+}
+
+/// Fill the sidebar's picker with one directory.
+///
+/// Directories come first so the navigation is at the top, and only the formats the
+/// gateway accepts as a reference are offered: a TIFF would be read, uploaded and then
+/// refused by the server, which is a worse way to find out than not being listed.
+async fn browse(state: State) {
+    let dir = state.dir.get_untracked();
+    match fs::list(&dir).await {
+        Ok(listing) => {
+            let mut entries: Vec<Pick> = listing
+                .entries
+                .into_iter()
+                .filter(|entry| match entry.kind {
+                    EntryKind::Dir => true,
+                    EntryKind::File => image_mime(&entry.name).is_some_and(accepts_input_mime),
+                    _ => false,
+                })
+                .map(|entry| Pick {
+                    path: if dir.is_empty() {
+                        entry.name.clone()
+                    } else {
+                        format!("{dir}/{}", entry.name)
+                    },
+                    name: entry.name,
+                    dir: entry.kind == EntryKind::Dir,
+                })
+                .collect();
+            entries.sort_by(|a, b| b.dir.cmp(&a.dir).then_with(|| a.name.cmp(&b.name)));
+            state.entries.set(entries);
+        }
+        Err(err) => state.notice.set(Some(format!("cannot read {dir}: {err}"))),
+    }
+}
+
+/// Open the picker, or close it and go back to the folder listing.
+fn toggle_browsing(state: State) {
+    let open = !state.browsing.get_untracked();
+    state.browsing.set(open);
+    if open {
+        state.dir.set(String::new());
+        spawn_local(browse(state));
+    }
+}
+
+/// Read a file and keep it as a reference image.
+///
+/// The read is what the picker's click costs, so it happens here rather than at Generate:
+/// a file that cannot be read says so while the user is still looking at the picker, not
+/// after they have written a prompt.
+fn add_source(state: State, path: String, name: String) {
+    // Refused at the click so the answer is immediate; checked again below, where the
+    // list is read fresh, because reading a file takes a moment and two quick clicks
+    // would otherwise both decide they fit.
+    let sources = state.sources.get_untracked();
+    if sources.iter().any(|source| source.path == path) {
+        state
+            .notice
+            .set(Some(format!("{name} is already a source")));
+        return;
+    }
+    if sources.len() >= MAX_INPUT_IMAGES {
+        state
+            .notice
+            .set(Some(format!("at most {MAX_INPUT_IMAGES} sources")));
+        return;
+    }
+
+    spawn_local(async move {
+        let bytes = match fs::read_bytes(&path).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                state
+                    .notice
+                    .set(Some(format!("could not read {name}: {err}")));
+                return;
+            }
+        };
+        let b64 = match app_sdk::image::encode_base64(&bytes) {
+            Ok(b64) => b64,
+            Err(err) => {
+                state.notice.set(Some(err));
+                return;
+            }
+        };
+
+        let mut sources = state.sources.get_untracked();
+        if sources.iter().any(|source| source.path == path) {
+            return;
+        }
+        if sources.len() >= MAX_INPUT_IMAGES {
+            state
+                .notice
+                .set(Some(format!("at most {MAX_INPUT_IMAGES} sources")));
+            return;
+        }
+        sources.push(Source { path, name, b64 });
+        state.sources.set(sources);
+    });
+}
+
+/// Drop one reference image from the next request.
+fn remove_source(state: State, path: String) {
+    state
+        .sources
+        .update(|sources| sources.retain(|source| source.path != path));
+}
+
+/// A saved image becomes a reference for the next one.
+fn source_from_kept(state: State, kept: Kept) {
+    add_source(state, kept.path, kept.name);
 }
 
 /// Move a saved image to the trash, like any other file.
@@ -359,6 +546,37 @@ const STYLES: &str = "
 .img-note { font-size: 11px; line-height: 1.45; color: #ffc9a0; }
 .img-cost { font-size: 10.5px; opacity: .5; font-family: ui-monospace, monospace;
             margin-left: auto; }
+/* The sources for the next request, and the picker's own header. */
+.img-sources { display: flex; gap: 8px; align-items: center; padding: 8px 12px 0;
+               flex: none; flex-wrap: wrap; }
+.img-sources-label { font-size: 11px; opacity: .6; }
+.img-source { position: relative; display: flex; flex-direction: column; gap: 2px;
+              width: 62px; }
+.img-source img { width: 62px; height: 46px; object-fit: cover; border-radius: 6px;
+                  display: block; background: rgba(255,255,255,.04); }
+.img-source-name { font-size: 9.5px; opacity: .55; overflow: hidden;
+                   text-overflow: ellipsis; white-space: nowrap; }
+.img-source-x { position: absolute; top: 2px; right: 2px; border: 0; cursor: pointer;
+                border-radius: 4px; line-height: 1; font-size: 11px; padding: 1px 4px;
+                background: rgba(0,0,0,.55); color: #fff; }
+.img-browse-head { display: flex; gap: 6px; align-items: center; margin-bottom: 4px; }
+.img-browse-path { flex: 1; min-width: 0; font-size: 10.5px; font-family: ui-monospace,
+                   monospace; opacity: .65; overflow: hidden; text-overflow: ellipsis;
+                   white-space: nowrap; direction: rtl; text-align: left; }
+.img-browse-item { display: block; width: 100%; text-align: left; background: none;
+                   border: 0; color: inherit; font: inherit; cursor: pointer;
+                   padding: 5px 7px; border-radius: 8px; font-size: 12px;
+                   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.img-browse-item:hover { background: rgba(255,255,255,.06); }
+.img-advanced { flex: none; padding: 0 12px 4px; font-size: 11.5px; }
+.img-advanced summary { cursor: pointer; opacity: .6; }
+.img-advanced-row { display: flex; gap: 10px; flex-wrap: wrap; padding-top: 6px; }
+.img-advanced-field { display: flex; align-items: center; gap: 6px; opacity: .8; }
+.img-advanced-field input { width: 84px; padding: 5px 7px; border-radius: 7px;
+                            border: 1px solid rgba(255,255,255,.12);
+                            background: rgba(255,255,255,.05); color: inherit;
+                            font-family: inherit; font-size: 12px; }
+.img-advanced-field.wide input { width: 240px; }
 ";
 
 app_sdk::app! {
@@ -384,12 +602,21 @@ app_sdk::app! {
             shots: RwSignal::new(Vec::new()),
             kept: RwSignal::new(Vec::new()),
             viewing: RwSignal::new(None),
+            sources: RwSignal::new(Vec::new()),
+            browsing: RwSignal::new(false),
+            dir: RwSignal::new(String::new()),
+            entries: RwSignal::new(Vec::new()),
             notice: RwSignal::new(None),
             credits: RwSignal::new(None),
             has_text: RwSignal::new(false),
         };
 
         let composer = NodeRef::<Textarea>::new();
+        // The advanced inputs: uncontrolled like the prompt, so typing in them cannot
+        // move the caret, and read once when a request goes out.
+        let negative = NodeRef::<Input>::new();
+        let steps = NodeRef::<Input>::new();
+        let guidance = NodeRef::<Input>::new();
 
         // Bootstrap: what this server offers, and what is already in the folder. The
         // folder is created when it is missing, so a first run with a writable root just
@@ -537,6 +764,70 @@ app_sdk::app! {
                 <div class="img-body">
                     <div class="img-side" style=format!("border-color:{stroke};")>
                         {move || {
+                            // The sidebar has one job at a time: show what is in `images/`,
+                            // or walk the sandbox to pick a source for the next request.
+                            if state.browsing.get() {
+                                let dir = state.dir.get();
+                                let up = parent(&dir);
+                                let label = if dir.is_empty() {
+                                    "Sandbox".to_owned()
+                                } else {
+                                    dir.clone()
+                                };
+                                return view! {
+                                    <div class="img-browse-head">
+                                        <button
+                                            class="img-btn"
+                                            title="Up one folder"
+                                            disabled=dir.is_empty()
+                                            on:click=move |_| {
+                                                state.dir.set(up.clone());
+                                                spawn_local(browse(state));
+                                            }
+                                        >
+                                            "↑"
+                                        </button>
+                                        <span class="img-browse-path" title=label.clone()>{label.clone()}</span>
+                                        <button class="img-btn" on:click=move |_| toggle_browsing(state)>
+                                            "Done"
+                                        </button>
+                                    </div>
+                                    {move || {
+                                        let entries = state.entries.get();
+                                        if entries.is_empty() {
+                                            return view! {
+                                                <p class="img-empty">"No folders and no PNG, JPEG or WebP files here."</p>
+                                            }.into_any();
+                                        }
+                                        view! {
+                                            <For each=move || state.entries.get() key=|pick| pick.path.clone() let:pick>
+                                                {
+                                                    let to_open = pick.path.clone();
+                                                    let name = pick.name.clone();
+                                                    let is_dir = pick.dir;
+                                                    view! {
+                                                        <button
+                                                            class="img-browse-item"
+                                                            title=name.clone()
+                                                            on:click=move |_| {
+                                                                if is_dir {
+                                                                    state.dir.set(to_open.clone());
+                                                                    spawn_local(browse(state));
+                                                                } else {
+                                                                    add_source(state, to_open.clone(), name.clone());
+                                                                }
+                                                            }
+                                                        >
+                                                            {if is_dir { format!("🗀 {name}") } else { name.clone() }}
+                                                        </button>
+                                                    }
+                                                }
+                                            </For>
+                                        }.into_any()
+                                    }}
+                                }.into_any();
+                            }
+
                             let list = state.kept.get();
                             if list.is_empty() {
                                 return view! {
@@ -593,6 +884,13 @@ app_sdk::app! {
                                                 </a>
                                                 <button
                                                     class="img-btn"
+                                                    title="Use this picture as the start of the next one"
+                                                    on:click=move |_| source_from_kept(state, kept.clone())
+                                                >
+                                                    "Use as source"
+                                                </button>
+                                                <button
+                                                    class="img-btn"
                                                     on:click=move |_| state.viewing.set(None)
                                                 >
                                                     "Close"
@@ -620,7 +918,9 @@ app_sdk::app! {
                                                     <br/>
                                                     "Every result is saved to "
                                                     <code>"images/"</code>
-                                                    " in your files, so the Gallery can show it and the trash can bring it back."
+                                                    " in your files, so the Gallery can show it and the trash can bring it back. Add a "
+                                                    <b>"source"</b>
+                                                    " to start from a picture instead of a blank page — one from here, or any PNG, JPEG or WebP in your files."
                                                 </p>
                                             }.into_any();
                                         }
@@ -671,21 +971,76 @@ app_sdk::app! {
                             }}
                         </div>
 
+                        <div class="img-sources">
+                            <span class="img-sources-label">"source"</span>
+                            {move || state.sources.get().into_iter().map(|source| {
+                                let remove = source.path.clone();
+                                let title = source.name.clone();
+                                view! {
+                                    <div class="img-source" title=title>
+                                        <img src=fs::raw_url(&source.path) alt=""/>
+                                        <span class="img-source-name">{source.name}</span>
+                                        <button
+                                            class="img-source-x"
+                                            title="Remove this source"
+                                            on:click=move |_| remove_source(state, remove.clone())
+                                        >
+                                            "×"
+                                        </button>
+                                    </div>
+                                }
+                            }).collect_view()}
+                            <button
+                                class="img-btn"
+                                title="Pick a picture from your files to start from"
+                                on:click=move |_| toggle_browsing(state)
+                            >
+                                {move || if state.browsing.get() { "Cancel" } else { "+ source" }}
+                            </button>
+                            <Show when=move || !state.sources.get().is_empty()>
+                                <button class="img-btn" on:click=move |_| state.sources.set(Vec::new())>
+                                    "Clear"
+                                </button>
+                            </Show>
+                        </div>
+
+                        <details class="img-advanced">
+                            <summary>"advanced"</summary>
+                            <div class="img-advanced-row">
+                                <label class="img-advanced-field wide">
+                                    "avoid"
+                                    <input node_ref=negative placeholder="what not to draw" autocomplete="off"/>
+                                </label>
+                                <label class="img-advanced-field">
+                                    "steps"
+                                    <input node_ref=steps inputmode="numeric" placeholder="model default" autocomplete="off"/>
+                                </label>
+                                <label class="img-advanced-field">
+                                    "guidance"
+                                    <input node_ref=guidance inputmode="numeric" placeholder="model default" autocomplete="off"/>
+                                </label>
+                            </div>
+                        </details>
+
                         <div class="img-composer" style=format!("border-color:{stroke};")>
                             <textarea
                                 class="img-input"
                                 node_ref=composer
                                 rows="2"
                                 placeholder=move || if ready() {
-                                    "Describe a picture — Ctrl+Enter to draw"
+                                    if state.sources.get().is_empty() {
+                                        "Describe a picture — Ctrl+Enter to draw".to_owned()
+                                    } else {
+                                        "Describe what to make of the source — Ctrl+Enter to draw".to_owned()
+                                    }
                                 } else {
-                                    "the server has no image provider configured"
+                                    "the server has no image provider configured".to_owned()
                                 }
                                 on:input=move |ev| state.has_text.set(!event_target_value(&ev).trim().is_empty())
                                 on:keydown=move |ev: web_sys::KeyboardEvent| {
                                     if ev.key() == "Enter" && (ev.ctrl_key() || ev.meta_key()) {
                                         ev.prevent_default();
-                                        generate(state, key_ctx.clone(), composer);
+                                        generate(state, key_ctx.clone(), composer, negative, steps, guidance);
                                     }
                                 }
                             ></textarea>
@@ -697,7 +1052,7 @@ app_sdk::app! {
                                         || !ready()
                                         || !state.has_text.get()
                                 }
-                                on:click=move |_| generate(state, click_ctx.clone(), composer)
+                                on:click=move |_| generate(state, click_ctx.clone(), composer, negative, steps, guidance)
                             >
                                 {move || if state.phase.get() == Phase::Waiting { "Drawing…" } else { "Generate" }}
                             </button>

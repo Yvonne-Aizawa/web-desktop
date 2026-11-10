@@ -25,6 +25,21 @@
 //! let bytes = app_sdk::image::decode_base64(&answer.images[0].b64_json).unwrap();
 //! # }
 //! ```
+//!
+//! For img2img the request carries reference images instead of starting from nothing:
+//! read a file out of the sandbox with [`crate::fs::read_bytes`], turn it into base64 with
+//! [`encode_base64`], and put it on [`ImageRequest::input_images`]. The gateway checks
+//! each one — that it is base64, how big it is, and that the bytes start like a PNG, a JPEG
+//! or a WebP — so a file that is not a picture a model can take is refused with a sentence
+//! rather than forwarded.
+//!
+//! ```no_run
+//! # async fn example(source_bytes: Vec<u8>) {
+//! let source = app_sdk::image::encode_base64(&source_bytes).unwrap();
+//! let request = app_sdk::image::ImageRequest::new("repaint it at noon")
+//!     .with_input_images(vec![source]);
+//! # }
+//! ```
 
 use gloo_net::http::Request;
 use shared::image::{API_IMAGE_GENERATE, API_IMAGE_INFO};
@@ -33,6 +48,7 @@ use shared::image::{API_IMAGE_GENERATE, API_IMAGE_INFO};
 // so an app can name a request and its result without depending on `shared` itself.
 pub use shared::image::{
     DEFAULT_SIZES, GeneratedImage, ImageInfo, ImageRequest, ImageResponse, MAX_COUNT,
+    MAX_INPUT_IMAGES, accepts_input_mime,
 };
 
 /// What this server's gateway offers. `info().enabled()` is false when it is off.
@@ -86,10 +102,28 @@ pub fn decode_base64(data: &str) -> Result<Vec<u8>, String> {
     Ok(bytes_of(&binary))
 }
 
+/// Base64 for a reference image, in the shape [`ImageRequest::input_images`] wants it.
+///
+/// The other half of [`decode_base64`], and the reason an app can send a file it read out
+/// of the sandbox back as an img2img source: `btoa` is the browser's encoder, and it takes
+/// a string whose code points are the bytes.
+pub fn encode_base64(bytes: &[u8]) -> Result<String, String> {
+    let window = web_sys::window().ok_or_else(|| "no browser window".to_owned())?;
+    window
+        .btoa(&binary_of(bytes))
+        .map_err(|_| "the image could not be encoded".to_owned())
+}
+
 /// `atob`'s result, whose code points are the bytes. Split out so the mapping can be
 /// tested on the host, where there is no `window` to call `atob` on.
 fn bytes_of(binary: &str) -> Vec<u8> {
     binary.chars().map(|byte| byte as u8).collect()
+}
+
+/// The string `btoa` expects: one code point per byte, high ones included. The mirror of
+/// [`bytes_of`], and split out for the same reason.
+fn binary_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| *byte as char).collect()
 }
 
 /// The server's own words when it sends an `ApiError`, a status code otherwise.
@@ -106,7 +140,7 @@ async fn error_message(response: gloo_net::http::Response, status: u16) -> Strin
 
 #[cfg(test)]
 mod tests {
-    use super::bytes_of;
+    use super::{binary_of, bytes_of};
 
     #[test]
     fn a_binary_string_becomes_one_byte_per_code_point() {
@@ -116,5 +150,14 @@ mod tests {
         // NUL is a byte like any other, and a code point above 0xFF cannot occur.
         assert_eq!(bytes_of("a\u{0}b"), vec![b'a', 0x00, b'b']);
         assert_eq!(bytes_of(""), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn the_encoder_gets_the_same_string_the_decoder_would_have_produced() {
+        // The two directions have to agree, or an app that reads a file and sends it back
+        // would send something the server's signature check does not recognise.
+        let bytes = vec![b'P', 0x89, b'N', b'G', 0x00, 0xFF];
+        assert_eq!(binary_of(&bytes), "P\u{89}NG\u{0}\u{ff}");
+        assert_eq!(bytes_of(&binary_of(&bytes)), bytes);
     }
 }

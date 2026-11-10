@@ -32,6 +32,22 @@ pub const DEFAULT_SIZES: [&str; 5] = ["1024x1024", "1792x1024", "1024x1792", "51
 /// caps at the same number so an app cannot ask for more than the provider will take.
 pub const MAX_COUNT: u32 = 10;
 
+/// Most reference images one img2img request may carry. The provider takes an array and
+/// a model that composes will use them, but each one is base64 in the request body, so
+/// the number is small on purpose.
+pub const MAX_INPUT_IMAGES: usize = 4;
+
+/// The formats the gateway accepts as an `input_images` reference: the raster formats the
+/// provider's img2img models are built around. Anything else is refused rather than
+/// forwarded, because a provider that cannot decode it answers with something less
+/// useful than the name of the file the user picked.
+pub const INPUT_MIMES: [&str; 3] = ["image/png", "image/jpeg", "image/webp"];
+
+/// Whether a sniffed MIME type is one [`INPUT_MIMES`] accepts.
+pub fn accepts_input_mime(mime: &str) -> bool {
+    INPUT_MIMES.contains(&mime)
+}
+
 /// What the server's image gateway is configured to do.
 ///
 /// Carried in [`crate::Catalog`] as well, so Settings can report it the way it reports
@@ -58,11 +74,12 @@ impl ImageInfo {
 ///
 /// Only the fields this desktop means to send are modelled: the server builds the
 /// provider's body field by field rather than forwarding a caller's JSON, so a field
-/// added here is a deliberate decision. The model-specific controls the provider
-/// documents (`steps`, `guidance`, `loras`, and `input_images` for the img2img
-/// variants) are the natural extension — each is one more explicit option, not a
-/// passthrough map.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// added here is a deliberate decision. [`Self::input_images`] is what makes a request
+/// img2img rather than text-to-image; the remaining model-specific controls the provider
+/// documents (`width`/`height` as free sizes, `output_quality`, and the `lora_weights` /
+/// `lora_scale` pair) are the same kind of addition — one more explicit option with its
+/// own bound, not a passthrough map.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageRequest {
     /// What to draw. Prompt conventions vary by model; the server only bounds the length.
     pub prompt: String,
@@ -91,6 +108,17 @@ pub struct ImageRequest {
     /// provider's own default, which is why the response reports what it actually got.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_format: Option<String>,
+    /// Reference images for the img2img and editing models: base64 of the file's bytes,
+    /// with no `data:` prefix, one per image. Empty means text-to-image.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_images: Vec<String>,
+    /// Diffusion steps, for the FLUX and SDXL variants that accept it. More is slower
+    /// and more refined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steps: Option<u32>,
+    /// Classifier-free guidance scale, for the models that accept it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<f32>,
 }
 
 fn one() -> u32 {
@@ -110,6 +138,9 @@ impl ImageRequest {
             seed: None,
             negative_prompt: None,
             output_format: None,
+            input_images: Vec::new(),
+            steps: None,
+            guidance: None,
         }
     }
 
@@ -125,6 +156,12 @@ impl ImageRequest {
 
     pub fn with_size(mut self, size: impl Into<String>) -> Self {
         self.size = Some(size.into());
+        self
+    }
+
+    /// Reference images for the img2img models, already base64.
+    pub fn with_input_images(mut self, images: Vec<String>) -> Self {
+        self.input_images = images;
         self
     }
 }
@@ -181,7 +218,7 @@ impl GeneratedImage {
 
 #[cfg(test)]
 mod tests {
-    use super::{GeneratedImage, ImageInfo, ImageRequest};
+    use super::{GeneratedImage, ImageInfo, ImageRequest, accepts_input_mime};
 
     #[test]
     fn a_gateway_with_no_model_is_off() {
@@ -209,6 +246,32 @@ mod tests {
     fn a_request_without_a_count_still_means_one() {
         let request: ImageRequest = serde_json::from_str(r#"{"prompt":"a ship"}"#).unwrap();
         assert_eq!(request.n, 1);
+        assert!(request.input_images.is_empty());
+    }
+
+    #[test]
+    fn reference_images_are_omitted_when_there_are_none() {
+        let bare = ImageRequest::new("a ship");
+        assert!(
+            !serde_json::to_string(&bare)
+                .unwrap()
+                .contains("input_images")
+        );
+
+        let with_source = bare.with_input_images(vec!["aGk=".to_owned()]);
+        assert_eq!(
+            serde_json::to_string(&with_source).unwrap(),
+            r#"{"prompt":"a ship","n":1,"input_images":["aGk="]}"#
+        );
+    }
+
+    #[test]
+    fn only_the_raster_formats_the_models_take_are_accepted_as_references() {
+        assert!(accepts_input_mime("image/png"));
+        assert!(accepts_input_mime("image/jpeg"));
+        assert!(accepts_input_mime("image/webp"));
+        assert!(!accepts_input_mime("image/svg+xml"));
+        assert!(!accepts_input_mime("application/octet-stream"));
     }
 
     #[test]
