@@ -243,6 +243,14 @@ This is the difference between a convention and a guarantee. Telling an agent "d
 touch `Lumina`" is a convention; putting it in the config is a guarantee, and it is also
 enforced against the file browser itself, which until now would happily delete it.
 
+### The browser suite
+
+`cargo xtask e2e` builds everything and drives a real Firefox through the app: the window
+manager, the file browser, image previews, the editor, the gallery, the served apps, the
+proxy, the trash and the read-only fence. It is the only test here that answers "does it
+work when a person clicks it?"; see `crates/e2e/README.md` for what it covers and how to
+run one scenario while working on it.
+
 ### Configuration
 
 The server reads its settings from the environment, and loads a `.env` file first if
