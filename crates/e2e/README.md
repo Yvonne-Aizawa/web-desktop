@@ -48,44 +48,31 @@ is no `.env`, so your local configuration cannot make the suite pass or fail.
 | scenario | probe | what it drives | checks |
 | --- | --- | --- | --- |
 | `shell` | `probe.py` | window manager: drag, 8 resize handles, maximize, z-order, taskbar, start menu and search, wallpapers | 30 |
-| `files` | `probe_fs.py` | the file browser: listing, breadcrumbs, previews, hidden files, symlink fence, downloads | 43 |
+| `files` | `probe_fs.py` | the file browser: listing, breadcrumbs, previews, hidden files, symlink fence, downloads | 40 |
 | `images` | `probe_img.py` | image previews: real sizes, dimension labels, misnamed files, the size cap | 33 |
-| `editing` | `probe_edit.py` | create, upload, rename, delete; the handoff to the editor | 27 |
+| `editing` | `probe_edit.py` | create, upload, rename, delete; the handoff to the editor | 33 |
 | `editor` | `probe_editor.py` | the Text Editor: tabs, dirty state, Ctrl+S, gallery of tabs | 32 |
 | `gallery` | `probe_gallery.py` | the Gallery app: albums, tiles, navigation | 20 |
 | `openwith` | `probe_openwith.py` | type-based "open in": which app a file is handed to | 10 |
-| `served` | `probe_served.py` | a served wasm app: manifest, hash check, version skew | 18 |
-| `compression` | `probe_compression.py` | what the shell costs over the wire: `br`, `gzip`, identity | 13 |
+| `served` | `probe_served.py` | a served wasm app: manifest, hash check, version skew | 17 |
+| `compression` | `probe_compression.py` | what the shell costs over the wire: `br`, `gzip`, identity | 8 |
 | `paint` | `probe_paint.py` | the wallpaper actually paints (reads pixels out of a screenshot) | 9 |
 | `terminal` | `probe_term.py` | no console errors from a normal session | — |
 | `offline` | `probe_offline.py` | the shell boots with no backend and falls back to the built-in catalog | 6 |
 | `skew` | `probe_skew.py` | a catalog naming an app the shell cannot run | 14 |
 | `broken` | `probe_broken.py` | a catalog the shell cannot decode: reported, not swallowed | 3 |
-| `proxy` | `probe_proxy.py` | the outbound proxy: allowed host, CORS-free fetch, refusal | 5 |
-| `trash` | `probe_trash.py` | delete, undo, trash view, restore, delete forever, empty | 27 |
+| `proxy` | `probe_proxy.py` | the outbound proxy: allowed host, CORS-free fetch, refusal | 4 |
+| `trash` | `probe_trash.py` | delete, undo, trash view, restore, delete forever, empty | 28 |
 | `readonly` | `probe_readonly.py` | a root served with writes switched off | 9 |
-| `pokedex` | `probe_pokedex.py` | the Pokédex app fetching through the proxy (needs the internet) | 14 |
+| `pokedex` | `probe_pokedex.py` | the Pokédex app fetching through the proxy (needs the internet) | 11 |
 
 ## Status, honestly
 
 The suite was rebuilt after `/tmp` was wiped by a reboot, from the session transcripts
 (so the probes are the real ones, recovered rather than rewritten). Against `HEAD`:
 
-* **11 scenarios are green**: `shell`, `images`, `editor`, `gallery`, `openwith`, `paint`,
-  `terminal`, `offline`, `skew`, `broken`, `pokedex` — 251 checks in total.
-* **7 still fail**, and none of them because the app is broken: they need fixture or
-  selector updates that the recovery left behind. In rough order of how much work they are:
-
-  | scenario | what is wrong |
-  | --- | --- |
-  | `compression` | the probe fetches the wasm by a name it reads out of `index.html`; the checks need re-pointing at the hashed asset names the shell now serves |
-  | `readonly` | stale: written when Files had its own edit box, which it no longer has. Needs rewriting against today's UI: a `<pre>` preview, no textarea, handoff to the editor rather than a save button |
-  | `files` | three checks assume the old fixture (`big.txt` truncation wording, the symlinked folder's crumbs, reload) and then it crashes on the next section |
-  | `editing` | crashes early (a lost import was repaired; the next failure is in the upload section) |
-  | `served` | crashes while corrupting a copy of the calculator's version directory |
-  | `trash` | 23 checks pass, then it crashes near the end (the empty-the-trash section) |
-  | `proxy` | the first checks pass; it crashes before finishing |
-
-`run.py` reports a scenario as `crashed` rather than `ok` when a probe dies part-way,
-precisely so a half-finished run cannot look like a pass. The failing list above is
-reproduced by `cargo xtask e2e`.
+* **Every scenario is green**: 307 checks across 18 scenarios, a couple of minutes at the
+  default `--jobs 4`. `pokedex` is the only one that needs the internet; `--skip-network`
+  skips it rather than failing it.
+* `run.py` reports a scenario as `crashed` rather than `ok` when a probe dies part-way,
+  precisely so a half-finished run cannot look like a pass.

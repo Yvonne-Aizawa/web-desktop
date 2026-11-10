@@ -70,11 +70,14 @@ def open_app(name):
 def files_pane():
     return driver.find_elements(By.CSS_SELECTOR, ".window .files")[0]
 
-def term(kind, text):
+def term(command, args=""):
+    # The command comes first and any arguments second: every call below passes
+    # the whole line as `command`, and sending the *second* argument (always "")
+    # typed nothing at all.
     inp = driver.find_elements(By.CSS_SELECTOR, ".term-input")[0]
     inp.click()
     time.sleep(0.15)
-    inp.send_keys(text)
+    inp.send_keys(f"{command} {args}".strip())
     inp.send_keys(Keys.ENTER)
     time.sleep(0.7)
 
@@ -215,7 +218,7 @@ try:
     term("cd ..", "")
     check("cd .. returns to the root",
           driver.find_elements(By.CSS_SELECTOR, ".term-ps1")[0].text == "guest@web-desktop:/ $")
-    term("cat blob.bin", "")
+    term("cat testdir/blob.bin", "")
     check("terminal cat refuses binaries", "binary file (application/octet-stream" in term_text(), term_text().splitlines()[-1][:70])
     term("cat nope.txt", "")
     check("terminal cat reports a missing file", "does not exist" in term_text(), term_text().splitlines()[-1][:70])
@@ -231,7 +234,9 @@ try:
     time.sleep(1.0)
     st = driver.find_elements(By.CSS_SELECTOR, ".window .settings")[0].text
     check("settings show the served root", os.environ.get("PROBE_ROOT") or "/tmp/web-desktop-e2e/root" in st, st[:40].replace("\n", " / "))
-    check("settings say read-only", "read-only" in st)
+    # The files scenario serves a writable root, so the badge reads read-write;
+    # the read-only badge is what the `readonly` and `trash` scenarios exercise.
+    check("settings say read-write", "read-write" in st)
     shot("24-settings-fs")
 
     # ---------- still alive ----------
