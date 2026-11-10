@@ -18,7 +18,9 @@
 //! and owned by the row, so a drag repaints exactly one window.
 
 use leptos::prelude::*;
-use shared::{AppId, AppManifest, Health, ProxyInfo, Wallpaper, default_catalog, fs::FsInfo};
+use shared::{
+    AppId, AppManifest, Health, ProxyInfo, Wallpaper, ai::AiInfo, default_catalog, fs::FsInfo,
+};
 
 /// Height of the taskbar in CSS pixels; the window area excludes it.
 pub const TASKBAR_HEIGHT: f64 = 52.0;
@@ -111,6 +113,9 @@ pub struct Desktop {
     /// What the backend's outbound proxy allows, for Settings and for apps that want
     /// to check before asking.
     pub proxy: RwSignal<ProxyInfo>,
+    /// What the backend's chat gateway offers: which models, and which is the default.
+    /// Empty `models` means no provider is configured there.
+    pub ai: RwSignal<AiInfo>,
     pub start_open: RwSignal<bool>,
     /// A file handed to an app, as `(which app, which path)`.
     ///
@@ -145,6 +150,7 @@ impl Desktop {
             wallpaper: RwSignal::new(initial_wallpaper()),
             fs: RwSignal::new(FsInfo::disabled()),
             proxy: RwSignal::new(ProxyInfo::default()),
+            ai: RwSignal::new(fallback.ai),
             start_open: RwSignal::new(false),
             pending_open: RwSignal::new(None),
             health: RwSignal::new(None),
@@ -393,6 +399,7 @@ impl Desktop {
                     self.catalog_error.set(None);
                     self.fs.set(catalog.fs);
                     self.proxy.set(catalog.proxy);
+                    self.ai.set(catalog.ai);
                     if !catalog.wallpapers.is_empty() {
                         // Only fill in a default; never replace what is already set.
                         // The Gallery can set a wallpaper from a photo, which is a

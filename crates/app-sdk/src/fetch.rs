@@ -23,6 +23,8 @@ use gloo_net::http::Request;
 use serde::de::DeserializeOwned;
 use shared::API_PROXY;
 
+use crate::url::encode;
+
 /// The proxy URL for an absolute URL, for anyone who would rather use their own client.
 ///
 /// Percent-encodes everything outside the unreserved set, so a query string inside
@@ -60,22 +62,9 @@ pub async fn json<T: DeserializeOwned>(url: &str) -> Result<T, String> {
     serde_json::from_slice(&bytes).map_err(|err| format!("unexpected JSON from {url}: {err}"))
 }
 
-fn encode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{encode, proxy_url};
+    use super::proxy_url;
 
     #[test]
     fn a_url_survives_the_query_string() {
@@ -83,12 +72,5 @@ mod tests {
             proxy_url("https://api.example.com/a?b=c&d=e"),
             "/api/proxy?url=https%3A%2F%2Fapi.example.com%2Fa%3Fb%3Dc%26d%3De"
         );
-    }
-
-    #[test]
-    fn encoding_leaves_the_unreserved_set_alone() {
-        assert_eq!(encode("aZ0-_.~"), "aZ0-_.~");
-        assert_eq!(encode(" "), "%20");
-        assert_eq!(encode("/"), "%2F");
     }
 }

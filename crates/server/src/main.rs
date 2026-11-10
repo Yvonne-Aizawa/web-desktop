@@ -33,7 +33,19 @@
 //!                     means no proxying at all.
 //!   WEB_DESKTOP_PROXY_ALLOW_PRIVATE
 //!                     `on` to let the proxy reach private and loopback addresses
+//!   WEB_DESKTOP_AI_URL
+//!                     base URL of an OpenAI-compatible provider, e.g.
+//!                     `https://api.openai.com/v1`. Unset means the AI gateway is
+//!                     off.
+//!   WEB_DESKTOP_AI_KEY  the provider's key. Read here, never logged, never sent to
+//!                     the browser.
+//!   WEB_DESKTOP_AI_MODEL
+//!                     the model a request gets when it names none
+//!   WEB_DESKTOP_AI_MODELS
+//!                     comma-separated models an app may ask for. Defaults to just
+//!                     WEB_DESKTOP_AI_MODEL.
 
+mod ai;
 mod apps;
 mod fs;
 mod proxy;
@@ -64,6 +76,8 @@ pub struct AppState {
     apps_dir: Option<PathBuf>,
     /// Outbound proxy policy; `None` when it is switched off.
     proxy: Option<proxy::Proxy>,
+    /// Chat gateway; `None` when no provider URL is configured.
+    ai: Option<ai::Ai>,
     /// `None` when the filesystem API is switched off or its root is unusable.
     fs: Option<FsRoot>,
 }
@@ -111,6 +125,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // The AI gateway. Like the proxy, it is off until it is pointed somewhere, and the
+    // key is never logged: only the provider's base URL and the models on offer are,
+    // because both are things an operator needs to see to know it is wired up right.
+    let ai = ai::Ai::from_env();
+    if let Some(ai) = &ai {
+        let info = ai.info();
+        tracing::info!(
+            "ai: {} (models: {})",
+            ai.base_url(),
+            if info.models.is_empty() {
+                "none configured".to_owned()
+            } else {
+                info.models.join(", ")
+            }
+        );
+        if !ai.has_key() {
+            tracing::warn!(
+                "ai: WEB_DESKTOP_AI_KEY is not set; a hosted provider will refuse every request"
+            );
+        }
+        if !info.enabled() {
+            tracing::warn!("ai: no model configured; set WEB_DESKTOP_AI_MODEL");
+        }
+        catalog.ai = info;
+    } else {
+        tracing::info!(
+            "ai off: set WEB_DESKTOP_AI_URL=https://api.openai.com/v1 (and WEB_DESKTOP_AI_KEY) \
+             to let apps hold a conversation"
+        );
+    }
+
     // Served apps are appended to the compiled-in ones. They live under
     // /apps/<id>/<version>/, which is immutable, so the cache policy can treat
     // everything there as content-addressed.
@@ -156,6 +201,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         catalog,
         apps_dir: apps_dir.is_dir().then_some(apps_dir.clone()),
         proxy,
+        ai,
         fs: fs_root,
     });
 
@@ -163,6 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(API_HEALTH, get(health))
         .route(API_CATALOG, get(catalog_handler))
         .merge(fs::router())
+        .merge(ai::router())
         // The proxy makes outbound requests on this machine's behalf, so it gets the
         // same cross-site guard the file API has: a random page must not be able to
         // spend the user's network position.

@@ -156,6 +156,43 @@ pub fn Settings() -> impl IntoView {
             </section>
 
             <section class="pane">
+                <h3>"AI chat"</h3>
+                <Show
+                    when=move || desktop.ai.get().enabled()
+                    fallback=move || {
+                        view! {
+                            <div class="kv">
+                                <span>"status"</span>
+                                <span class="badge badge-wait">"off"</span>
+                            </div>
+                            <p class="muted">
+                                "Apps cannot hold a conversation with a model. Start the server with an OpenAI-compatible endpoint to enable it:"
+                            </p>
+                            <p class="path-value">
+                                "WEB_DESKTOP_AI_URL=https://api.openai.com/v1 WEB_DESKTOP_AI_KEY=… WEB_DESKTOP_AI_MODEL=gpt-4o-mini"
+                            </p>
+                        }
+                    }
+                >
+                    <div class="kv">
+                        <span>"status"</span>
+                        <span class="badge badge-ok">"on"</span>
+                    </div>
+                    <div class="kv">
+                        <span>"default model"</span>
+                        <span class="path-value">{move || desktop.ai.get().default_model}</span>
+                    </div>
+                    <div class="kv">
+                        <span>"offered"</span>
+                        <span class="path-value">{move || desktop.ai.get().models.join(", ")}</span>
+                    </div>
+                    <p class="muted">
+                        "The server holds the provider's key and makes the call, so an app never sees it and cannot name another host. Which models an app may ask for is the list above — the server refuses anything else."
+                    </p>
+                </Show>
+            </section>
+
+            <section class="pane">
                 <h3>"Windows"</h3>
                 <div class="kv">
                     <span>"open"</span>

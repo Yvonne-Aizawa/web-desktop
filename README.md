@@ -264,6 +264,10 @@ cp .env.example .env      # then edit
 | `WEB_DESKTOP_FS_READONLY` | empty | Paths inside the root that stay read-only, e.g. `Lumina,archive` |
 | `WEB_DESKTOP_PROXY_HOSTS` | empty (off) | Hosts the outbound proxy may reach |
 | `WEB_DESKTOP_PROXY_ALLOW_PRIVATE` | off | Also allow private and loopback addresses |
+| `WEB_DESKTOP_AI_URL` | empty (off) | An OpenAI-compatible provider the chat gateway may call |
+| `WEB_DESKTOP_AI_KEY` | empty | The provider's key. Read from here, never sent to the browser |
+| `WEB_DESKTOP_AI_MODEL` | empty | The model a request gets when it names none |
+| `WEB_DESKTOP_AI_MODELS` | just `WEB_DESKTOP_AI_MODEL` | Models an app may ask for |
 | `WEB_DESKTOP_APPS` | `apps` | Where built app bundles live |
 | `WEB_DESKTOP_DIST` | `crates/client/dist` | Where the client bundle is served from |
 | `RUST_LOG` | `server=info` | Log filter |
@@ -454,14 +458,142 @@ either: POST and other methods (the shape is one `enum Request`, so widening it 
 deliberate), per-host secret headers, and any caching. Settings shows whether the proxy is
 on and for which hosts.
 
+Not included *on purpose*, and the reason the next section exists: a `POST` with a body
+the caller composes, and a response that streams for minutes. Both are what a chat needs
+and both would blunt the checks above, so they live in a second module with a different
+(and much smaller) policy problem. Settings tells the two apart — they are separate
+panes, because they are separate decisions.
+
+### Talking to a chat model
+
+A chat app needs two things a browser cannot give it: the provider's key, which must
+never be shipped to the client, and a long-lived streamed answer, which is the opposite
+of what the proxy above is shaped for. So there is a second gateway, `server::ai`, and the
+app talks to that:
+
+```text
+app ──POST /api/ai/chat──▶ server ──POST {WEB_DESKTOP_AI_URL}/chat/completions──▶ provider
+```
+
+`crates/apps/chat` is the app that uses it. What makes this gateway much simpler to fence
+than the proxy is that **the caller never names an address**:
+
+| Setting | Effect |
+| --- | --- |
+| *(default)* | **Off.** `/api/ai/info` answers with an empty model list, and the app says so. |
+| `WEB_DESKTOP_AI_URL` | The provider's base URL, e.g. `https://api.openai.com/v1`. Any OpenAI-compatible server will do, including one on `127.0.0.1`. |
+| `WEB_DESKTOP_AI_KEY` | The provider's key. Never logged, never sent to the browser, never in the catalog. |
+| `WEB_DESKTOP_AI_MODEL` | What a request gets when it names no model. |
+| `WEB_DESKTOP_AI_MODELS` | The models an app may ask for. Defaults to just the one above. |
+
+Because the URL is configuration rather than input, there is no SSRF surface here at all:
+an app cannot ask the server to talk to something the operator did not point it at, which
+is also why this endpoint needs no host list and no private-address check. What a caller
+*can* choose is the model, and a model is a bill, so that choice is an allow-list — a
+request naming anything else is refused, and the refusal names the variable to widen.
+
+`Sec-Fetch-Site: cross-site` is rejected, the same guard the file API and the proxy carry.
+The endpoint spends the operator's key, so a random page must not be able to cause a
+request — a stronger reason for the guard than the file API's reads ever had.
+
+#### One endpoint, two shapes
+
+`POST /api/ai/chat` takes `{messages, model?, stream?}` and answers one of the two ways
+the OpenAI contract allows — which is why the `shared::ai` types are shaped the way they
+are, and what the app would be reading if it streamed:
+
+* **`stream: false`** — one `ChatResponse`: which model answered, the assistant's message,
+  and the token usage when the provider reports it. The whole answer, in one piece.
+* **`stream: true`** — `text/event-stream`, the provider's own frames relayed as they
+  arrive and ending in `data: [DONE]`. Deliberately a relay rather than a re-encoding: a
+  field the provider adds is not silently dropped on the way through, and any OpenAI
+  client could be pointed at this endpoint unchanged. This is what the Chat app uses.
+
+The details that make streaming *work* rather than merely compile:
+
+* **A failure before the first frame is JSON.** The upstream status is checked and a
+  non-2xx body is read (capped) and turned into the shell's error shape **before** any of
+  it is streamed, so a caller can never be halfway through a stream when bad news arrives.
+* **No whole-request timeout on a stream.** A deadline that is right for a 10-second fetch
+  would cut a long answer off mid-sentence, so a connect timeout and an idle timeout
+  *between frames* are what apply instead.
+* **`Cache-Control: no-store` and `X-Accel-Buffering: no`.** Anything in front of the
+  server that decides to buffer would quietly turn streaming back into waiting.
+* **Dropping the stream is Stop.** When the client goes away, axum drops the body, the
+  upstream response goes with it, and the provider connection closes — so a cancelled
+  answer stops costing tokens with no cancellation plumbing. A semaphore bounds how many
+  answers are in flight, and the permit rides along inside the stream so that stays true
+  for the whole of one.
+
+A provider failure is remapped rather than passed through: a 401 from the provider becomes
+this server's **502**, naming `WEB_DESKTOP_AI_KEY`, because it is the operator's
+misconfiguration and telling the caller 401 would send them looking for a credential they
+do not have. The provider's own words are kept, since they are what names the fix.
+
+Verified against a stand-in provider rather than a real one — a real answer needs a key
+and a network, and neither belongs in a test. A finished answer becomes a `ChatResponse`;
+a streamed one arrives frame by frame with the provider's own `[DONE]`; a provider 401
+reads as 502 with the provider's message; a model outside the list is refused *before*
+anything is sent; and a gateway with no URL explains itself instead of 404ing.
+
+The "dropping the stream is Stop" claim was checked against a provider that reports how
+much it managed to write: pointing a client at a 40-frame stream and hanging up after
+three frames left the provider with a broken pipe after four. Had the server buffered the
+answer, the provider would have written all forty before anyone could hang up.
+
+Still open: nothing caps what one answer may cost (no `max_tokens` is sent, because the
+field name differs between providers and getting it wrong fails every request), and there
+is no per-caller rate limit beyond the in-flight cap.
+
+#### The Chat app
+
+`crates/apps/chat` is a served app, and the first one that writes: each conversation is
+one JSON document under `chats/` in the same sandbox Files browses. Nothing new was
+needed on the server for that — `app-sdk`'s `fs` feature is a thin wrapper over the file
+API that already existed — and it inherits what that API already promises: rename it,
+copy it, open it in the Text Editor, and if you delete it, put it back from the trash. A
+read-only root arrives as a sentence in the footer rather than a crash, and the chat in
+memory is still there.
+
+Two details are load-bearing: the first is the editor's lesson again, and the second is
+new here.
+
+* **The textarea is uncontrolled, as in the editor.** A `has_text` signal is kept in step
+  by `on:input`, but it is never bound back to `value`: that rewrites the box on every
+  keystroke, and browsers move the caret to the end when they do.
+* **The window's state is one `Copy` struct of signals, with no `Rc` anywhere.** The same
+  `Rc<dyn Fn(..)>` that is fine captured in an `on:click` handler is refused in a
+  `{move || …}` child, which must be `Send + Sync` — and the error names the `Rc`, not the
+  closure that captured it. Signals are `Copy` and `Send`, so a bundle of them is both,
+  and the actions (`send`, `open_saved`, `remove_saved`) are plain functions taking one.
+
+Answers stream, because the server has the other half of it. The app turns on `ai-stream`
+and `chat_stream` hands each piece to a closure that appends it to a `streaming` signal,
+rendered as one more bubble until the answer is complete and becomes a message. Stop
+aborts an `AbortController` rather than setting a flag the read loop would only notice at
+the next word: a read that has not resolved yet cannot see a flag, so a model thinking for
+five seconds would look like a dead button. The controller is a JS value, which means it
+cannot go in a signal — it is kept in a `StoredValue<_, LocalStorage>`, whose handle is
+`Copy` and `Send` even though the value inside is neither, and which is the reason the
+`State` bundle can list it beside the signals.
+
+The SSE reassembly is the one piece with real edge cases, and it is unit-tested on the
+host rather than in a browser (`cargo test -p app-sdk --features ai-stream`): an event
+split across chunks, several events in one chunk, `\r\n` line endings, a comment-only
+keep-alive, `data:` with no space, and a multi-byte character whose bytes land on either
+side of a chunk boundary. That last one is why the buffer is a `Vec<u8>` and the split is
+on bytes: no UTF-8 continuation byte is `\n`, so slicing there can never cut a character
+in half, which a chunk-at-a-time `from_utf8` would.
+
 ### Sample apps
 
-Two apps live in the repository, built with `cargo xtask build-app`:
+Three apps live in the repository, built with `cargo xtask build-app`:
 
 | App | Shows |
 | --- | --- |
 | `crates/apps/calculator` | A four-function calculator: signals, the host object, its own styles. |
 | `crates/apps/pokedex` | A random Pokémon from <https://pokeapi.co>: the proxy, and the SDK's `fetch`. |
+| `crates/apps/chat` | A conversation with a model the server talks to: the AI gateway, and the SDK's `ai` and `fs`. |
 
 The Pokédex is the one that exercises the network, and it needs the proxy to be told
 about the host:
@@ -537,7 +669,12 @@ app_sdk::app! {
 
 It needs `crate-type = ["cdylib"]`, `app-sdk`, and — unavoidably — `leptos` and
 `wasm-bindgen`: `view!` expands to absolute `leptos::` paths, and the `#[wasm_bindgen]`
-export needs its crate in scope. The SDK covers everything else.
+export needs its crate in scope. The SDK covers the shell, one opt-in feature at a time
+(`fetch`, `ai`, `ai-stream`, `fs`, so an app that never makes a request does not carry an
+HTTP client, and one that waits for a finished answer does not carry a stream reader);
+anything past that is the app's own business — `serde_json` for a document it keeps, or
+`web-sys` for a DOM element it has to read by hand, as `crates/apps/chat` does for its
+textarea.
 
 **An app must not enable `leptos/delegation`.** The shell enables it, which means the
 shell has a `click` listener on `window` that dispatches by looking for a `$$$click`

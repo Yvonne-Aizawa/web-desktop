@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod ai;
 pub mod fs;
 
 /// Interface version between the shell and a served app.
@@ -257,6 +258,10 @@ pub struct Catalog {
     /// fetching a third-party URL is even possible here.
     #[serde(default)]
     pub proxy: ProxyInfo,
+    /// What the chat gateway offers: which models, and which one is the default.
+    /// Empty `models` means it is off.
+    #[serde(default)]
+    pub ai: ai::AiInfo,
 }
 
 /// What the outbound proxy allows. Empty `hosts` means it is off.
@@ -292,6 +297,7 @@ pub fn default_catalog() -> Catalog {
         wallpapers: default_wallpapers(),
         fs: fs::FsInfo::disabled(),
         proxy: ProxyInfo::default(),
+        ai: ai::AiInfo::default(),
     }
 }
 

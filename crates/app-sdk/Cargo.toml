@@ -10,6 +10,22 @@ default = []
 # Opt in to `app_sdk::fetch`. Off by default so an app that never makes a request
 # does not carry an HTTP client and JSON parsing in its bundle.
 fetch = ["dep:gloo-net", "dep:serde", "dep:serde_json", "dep:shared"]
+# Opt in to `app_sdk::ai`: holding a conversation with a chat model, through the
+# server, so the app never holds a provider's key and never names its address.
+ai = ["dep:gloo-net", "dep:serde", "dep:serde_json", "dep:shared"]
+# Also read the answer as it arrives, one frame at a time. Separate from `ai` because a
+# reader needs the raw response body, a promise-based read loop and a way to abort it,
+# and an app that is happy to wait for the finished answer should not carry any of that.
+ai-stream = [
+    "ai",
+    "dep:wasm-bindgen-futures",
+    "web-sys/AbortSignal",
+    "web-sys/ReadableStream",
+    "web-sys/ReadableStreamDefaultReader",
+]
+# Opt in to `app_sdk::fs`: reading and writing files through the shell's file API,
+# inside the same fence the Files app lives in.
+fs = ["dep:gloo-net", "dep:serde", "dep:serde_json", "dep:shared"]
 
 [dependencies]
 # Only for `fetch`.
@@ -17,6 +33,8 @@ shared = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 gloo-net = { version = "0.7", default-features = false, features = ["http", "json"], optional = true }
+# `chat_stream` awaits the reader's promises.
+wasm-bindgen-futures = { version = "0.4", optional = true }
 
 # No `delegation` here, on purpose: see the module docs. Apps attach direct
 # listeners, which keeps them invisible to the shell's delegated dispatch.
