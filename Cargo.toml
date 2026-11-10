@@ -6,6 +6,7 @@ members = [
     "crates/app-sdk",
     "crates/apps/calculator",
     "crates/apps/pokedex",
+    "crates/apps/chat",
     "xtask",
 ]
 # The client only compiles to wasm, so keep it out of plain `cargo build`/`cargo run`.

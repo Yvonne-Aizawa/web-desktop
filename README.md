@@ -778,6 +778,12 @@ That shape is load-bearing, so it is worth knowing why:
   umask, and a replaced file takes the new default mode rather than keeping the old.
 * **Window layout is in memory only** (no persistence, no backend sync), and there
   is no client-side router.
+* **No markdown in Chat.** An answer is shown as plain text with its newlines kept, so a
+  code block survives only in the sense that the model indented it. Rendering it would
+  mean trusting model output as markup, which is its own decision.
+* **No retry after a broken stream.** Text that arrived before a failure is kept and the
+  failure is reported next to it, but the app does not try to pick the answer up where it
+  stopped — the provider has no way to resume one.
 
 Natural next steps: persist layout with `PUT /api/layout`, detect external edits by
 comparing mtime before saving, a WebSocket on a tokio `broadcast` channel to mirror

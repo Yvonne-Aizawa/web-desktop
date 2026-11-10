@@ -1,0 +1,10 @@
+{
+  "id": "chat",
+  "name": "Chat",
+  "glyph": "💬",
+  "accent": "#a78bfa",
+  "blurb": "A conversation with a model the server talks to",
+  "default_width": 640,
+  "default_height": 620,
+  "version": "0.1.0"
+}
