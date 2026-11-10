@@ -1,7 +1,8 @@
 """Run the browser suite: bring up a server and its fixtures, run one probe, tear down.
 
 Usage:
-    python3 run.py                 # every scenario
+    python3 run.py                 # every scenario, four at a time
+    python3 run.py --jobs 8        # ... or some other level of parallelism
     python3 run.py --list          # what there is
     python3 run.py --only trash    # one or more, comma separated
     python3 run.py --keep          # leave fixtures, screenshots and logs in $E2E_WORK
@@ -10,15 +11,19 @@ Driven by `cargo xtask e2e`, which builds everything first; run directly when th
 build and the Python environment are already there.
 
 A scenario is a probe plus whatever it needs around it: a fixture tree, one or
-more servers, and environment. Probes are plain scripts that print `PASS`/`FAIL`
-lines and exit non-zero when something failed, so they can be run by hand against
-a server that is already up:
+more servers, and environment. Scenarios are independent by construction — each
+gets its own ports (handed out at 8200 and up), its own slice of $E2E_WORK for
+fixtures and screenshots, and its own browser — so several run at once, four by
+default. Probes are plain scripts that print `PASS`/`FAIL` lines and exit non-zero
+when something failed, so they can be run by hand against a server that is
+already up:
 
     PROBE_URL=http://127.0.0.1:8096 PROBE_ROOT=/tmp/trashtest \
       python3 probes/probe_trash.py
 """
 
 import argparse
+import concurrent.futures
 import os
 import shutil
 import signal
@@ -37,6 +42,9 @@ APPS = os.environ.get("E2E_APPS") or os.path.join(REPO, "apps")
 SERVER = os.path.join(REPO, "target/release/server")
 PYTHON = os.environ.get("E2E_PYTHON") or sys.executable
 
+# a run is over when no scenario is failed, crashed, or never got its server up
+BAD = ("failed", "crashed", "server did not start")
+
 # the shell's server, serving the built client and the built apps
 WEB = {"kind": "web"}
 # one static server over the same dist, with no /api behind it at all
@@ -48,7 +56,8 @@ BROKEN = {"kind": "python", "script": "serve/skew_serve.py", "port": 8096, "args
 PROXY = {"kind": "web", "port": 8096, "env": {
     "WEB_DESKTOP_PROXY_HOSTS": "127.0.0.1",
     "WEB_DESKTOP_PROXY_ALLOW_PRIVATE": "on",
-}, "also": [{"kind": "python", "script": "serve/upstream_serve.py", "port": 8099}]}
+}, "also": [{"kind": "python", "script": "serve/upstream_serve.py", "port": 8099,
+             "role": "upstream"}]}
 
 
 class Scenario:
@@ -66,6 +75,8 @@ class Scenario:
         self.env = env or {}
         self.network = network
         self.timeout = minutes * 60
+        # filled in by assign_ports: the flattened server specs, ports included
+        self.specs = []
 
 
 SCENARIOS = [
@@ -89,9 +100,10 @@ SCENARIOS = [
     # the same shell twice: once with the proxy allowed to reach pokeapi.co, once
     # with no proxy at all, to show what the app says when it cannot fetch
     Scenario("pokedex", "probe_pokedex.py", port=8094, network=True, servers=({
-        "kind": "web", "port": 8094, "env": {"WEB_DESKTOP_PROXY_HOSTS": "pokeapi.co"},
+        "kind": "web", "port": 8094, "role": "proxied",
+        "env": {"WEB_DESKTOP_PROXY_HOSTS": "pokeapi.co"},
     }, {
-        "kind": "web", "port": 8091, "env": {"WEB_DESKTOP_PROXY_HOSTS": ""},
+        "kind": "web", "port": 8091, "role": "plain", "env": {"WEB_DESKTOP_PROXY_HOSTS": ""},
     })),
 ]
 
@@ -107,7 +119,7 @@ def fixture_dir(scenario):
 
 
 def servers_for(scenario):
-    """Every server a scenario needs, with the fixture root and port filled in."""
+    """Every server a scenario needs, with the port filled in."""
     out = []
     for spec in scenario.servers:
         spec = dict(spec)
@@ -119,17 +131,40 @@ def servers_for(scenario):
     return out
 
 
-def server_env(scenario, spec):
+def assign_ports(scenarios, base=8200):
+    """Hand every scenario ports that are unique across the run, so scenarios
+    can run at the same time.
+
+    The declared ports deliberately collide (most scenarios want 8080); every
+    probe learns its URL from PROBE_URL, so only uniqueness within a run matters.
+    The server a probe talks to keeps the scenario's port; side servers (the
+    pokedex's plain shell, the proxy's upstream) each get their own."""
+    port = base
+    for scenario in scenarios:
+        specs = servers_for(scenario)
+        main = port
+        port += 1
+        for spec in specs:
+            if spec["port"] == scenario.port:
+                spec["port"] = main
+            else:
+                spec["port"] = port
+                port += 1
+        scenario.port = main
+        scenario.specs = specs
+
+
+def server_env(scenario, spec, root, work):
     env = dict(os.environ)
     env.update({
         "E2E_REPO": REPO,
-        "E2E_WORK": WORK,
+        "E2E_WORK": work,
         "E2E_DIST": DIST,
         "WEB_DESKTOP_DIST": DIST,
-        "WEB_DESKTOP_ADDR": f"127.0.0.1:{spec.get('port', scenario.port)}",
+        "WEB_DESKTOP_ADDR": f"127.0.0.1:{spec['port']}",
     })
     if spec.get("kind", "web") == "web":
-        env["WEB_DESKTOP_ROOT"] = os.path.join(WORK, fixture_dir(scenario))
+        env["WEB_DESKTOP_ROOT"] = root
         env["WEB_DESKTOP_APPS"] = APPS
         env["WEB_DESKTOP_FS"] = "on"
         env["WEB_DESKTOP_FS_WRITE"] = "on" if scenario.write else "off"
@@ -139,17 +174,17 @@ def server_env(scenario, spec):
     return env
 
 
-def start_server(scenario, spec, logfile):
+def start_server(scenario, spec, logfile, root, work):
     if spec.get("kind", "web") == "python":
-        cmd = [PYTHON, os.path.join(HERE, spec["script"]), str(spec.get("port", scenario.port)),
+        cmd = [PYTHON, os.path.join(HERE, spec["script"]), str(spec["port"]),
                *spec.get("args", [])]
     else:
         if not os.path.exists(SERVER):
             sys.exit(f"{SERVER} is missing: run `cargo xtask e2e` (or `cargo build --release -p server`)")
         cmd = [SERVER]
     fh = open(logfile, "ab")
-    return subprocess.Popen(cmd, env=server_env(scenario, spec), stdout=fh, stderr=subprocess.STDOUT,
-                            cwd=WORK, start_new_session=True)
+    return subprocess.Popen(cmd, env=server_env(scenario, spec, root, work), stdout=fh, stderr=subprocess.STDOUT,
+                            cwd=work, start_new_session=True)
 
 
 def wait_for(port, timeout=40):
@@ -180,20 +215,25 @@ def stop(processes):
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
 
 
-def probe_env(scenario, root):
+def probe_env(scenario, root, work):
     env = dict(os.environ)
     env.update({
         "E2E_REPO": REPO,
-        "E2E_WORK": WORK,
+        "E2E_WORK": work,
         "E2E_DIST": DIST,
         # the probe corrupts a copy of one app's version directory
         "E2E_APPS": os.path.join(APPS, "calculator"),
         "PROBE_URL": f"http://127.0.0.1:{scenario.port}/",
         "PROBE_ROOT": root,
-        # the pokedex probe serves the same shell twice: with the proxy on, and off
-        "PROXIED": "http://127.0.0.1:8094/",
-        "PLAIN": "http://127.0.0.1:8091/",
     })
+    # a probe with side servers learns where they are by role
+    for spec in scenario.specs:
+        if spec.get("role") == "proxied":
+            env["PROXIED"] = f"http://127.0.0.1:{spec['port']}/"
+        elif spec.get("role") == "plain":
+            env["PLAIN"] = f"http://127.0.0.1:{spec['port']}/"
+        elif spec.get("role") == "upstream":
+            env["UPSTREAM"] = f"http://127.0.0.1:{spec['port']}"
     env.update(scenario.env)
     return env
 
@@ -211,15 +251,21 @@ def run_scenario(scenario, keep):
     os.makedirs(logs, exist_ok=True)
     logfile = os.path.join(logs, f"{scenario.name}.log")
 
+    # a slice of the work dir per scenario, so scenarios running at the same
+    # time never rebuild or delete each other's fixtures and screenshots
+    work = os.path.join(WORK, scenario.name)
+    shutil.rmtree(work, ignore_errors=True)
+    os.makedirs(work)
     root = subprocess.run([PYTHON, os.path.join(HERE, "fixtures.py"), fixture_dir(scenario)],
-                          capture_output=True, text=True, check=True).stdout.strip()
+                          capture_output=True, text=True, check=True,
+                          env=dict(os.environ, E2E_WORK=work)).stdout.strip()
 
     processes = []
     try:
-        for spec in servers_for(scenario):
-            processes.append(start_server(scenario, spec, logfile))
-        for spec in servers_for(scenario):
-            if not wait_for(spec.get("port", scenario.port)):
+        for spec in scenario.specs:
+            processes.append(start_server(scenario, spec, logfile, root, work))
+        for spec in scenario.specs:
+            if not wait_for(spec["port"]):
                 return {"name": scenario.name, "status": "server did not start",
                         "checks": 0, "failed": 0, "output": ""}
 
@@ -227,13 +273,17 @@ def run_scenario(scenario, keep):
         with open(logfile, "ab") as fh:
             fh.write(f"\n=== {scenario.probe} {time.strftime('%H:%M:%S')}\n".encode())
         proc = subprocess.run([PYTHON, os.path.join(HERE, "probes", scenario.probe)],
-                              env=probe_env(scenario, root), cwd=REPO, capture_output=True,
+                              env=probe_env(scenario, root, work), cwd=REPO, capture_output=True,
                               text=True, timeout=scenario.timeout)
         output = proc.stdout + proc.stderr
         with open(logfile, "ab") as fh:
             fh.write(output.encode())
-        passed = output.count("\nPASS") + (1 if output.startswith("PASS") else 0)
-        failed = output.count("\nFAIL") + (1 if output.startswith("FAIL") else 0)
+        # every probe prints its checks as "PASS  " / "FAIL  " lines (two
+        # spaces); counting prefixes rather than substrings keeps a probe's
+        # own trailing "FAILED: <name>" summary from counting twice
+        lines = output.splitlines()
+        passed = sum(1 for line in lines if line.startswith("PASS  "))
+        failed = sum(1 for line in lines if line.startswith("FAIL  "))
         status = "ok" if proc.returncode == 0 and not failed else "failed"
         if "Traceback (most recent call last)" in output:
             # a probe that dies half-way must not look like a pass
@@ -243,13 +293,14 @@ def run_scenario(scenario, keep):
     finally:
         stop(processes)
         if not keep:
-            shutil.rmtree(os.path.join(WORK, "root"), ignore_errors=True)
-            shutil.rmtree(os.path.join(WORK, "trash"), ignore_errors=True)
-            shutil.rmtree(os.path.join(WORK, "readonly"), ignore_errors=True)
-        # the served-app probe copies a version to corrupt it, and cleans up after
-        # itself unless it crashed
-        for spare in ("0.1.1", "0.1.2"):
-            shutil.rmtree(os.path.join(APPS, "calculator", spare), ignore_errors=True)
+            shutil.rmtree(work, ignore_errors=True)
+        # the served-app probe copies a version to corrupt it, and cleans up
+        # after itself unless it crashed; only its own teardown may do that,
+        # so a scenario finishing alongside it cannot delete the copies
+        # mid-flight
+        if scenario.probe == "probe_served.py":
+            for spare in ("0.1.1", "0.1.2"):
+                shutil.rmtree(os.path.join(APPS, "calculator", spare), ignore_errors=True)
 
 
 def main():
@@ -258,7 +309,13 @@ def main():
     parser.add_argument("--list", action="store_true", help="list the scenarios and exit")
     parser.add_argument("--keep", action="store_true", help="keep fixtures, screenshots and logs")
     parser.add_argument("--skip-network", action="store_true", help="skip the probes that need the internet")
-    parser.add_argument("--fail-fast", action="store_true", help="stop at the first failure")
+    parser.add_argument("--fail-fast", action="store_true",
+                        help="stop at the first failure (with --jobs > 1, scenarios already running still finish)")
+    parser.add_argument("--jobs", type=int, default=4, metavar="N",
+                        help="scenarios to run at once (default: 4)")
+    parser.add_argument("--port-base", type=int, default=8200, metavar="PORT",
+                        help="hand ports out from here (default: 8200), so a second "
+                             "run of the suite alongside this one cannot collide")
     args = parser.parse_args()
 
     scenarios = SCENARIOS
@@ -275,40 +332,84 @@ def main():
             log(f"  {s.name:12} probes/{s.probe}")
         return 0
 
-    os.makedirs(WORK, exist_ok=True)
-    results = []
-    for scenario in scenarios:
-        log(f"\n=== {scenario.name}: {scenario.probe}")
+    assign_ports(scenarios, args.port_base)
+    jobs = max(1, min(args.jobs, len(scenarios)))
+    results = {}
+
+    def attempt(scenario):
+        """One scenario, as a unit of work: skip it, run it, or report that the
+        driver itself died — which must not look like a pass."""
         if scenario.network and (args.skip_network or not network_up()):
-            log("    skipped: needs the internet (pokeapi.co), and --skip-network is in effect")
-            results.append({"name": scenario.name, "status": "skipped", "checks": 0, "failed": 0,
-                            "output": ""})
-            continue
-        result = run_scenario(scenario, args.keep)
-        results.append(result)
+            return {"name": scenario.name, "status": "skipped", "checks": 0, "failed": 0,
+                    "output": ""}
+        try:
+            return run_scenario(scenario, args.keep)
+        except Exception as err:
+            return {"name": scenario.name, "status": "crashed", "checks": 0, "failed": 0,
+                    "output": f"Traceback (most recent call last)\ndriver error: {err}"}
+
+    def details(result):
+        """A scenario's lines, after it has run."""
         for line in result["output"].splitlines():
             if line.startswith("FAIL") or line.startswith("PASS"):
                 log("    " + line)
-        log(f"    {result['status']}: {result['checks']} checks, {result['failed']} failed")
-
-        if result["status"] in ("failed", "crashed", "server did not start"):
+        seconds = result.get("seconds")
+        log(f"    {result['status']}: {result['checks']} checks, {result['failed']} failed"
+            + (f" in {seconds:.0f}s" if seconds is not None else ""))
+        if result["status"] in BAD:
             for line in result["output"].splitlines():
                 if "Traceback" in line or line.strip().startswith("File \"") or "Error" in line:
                     log("    " + line)
-            if args.fail_fast:
-                break
 
-    bad = [r for r in results if r["status"] in ("failed", "crashed", "server did not start")]
-    skipped = [r for r in results if r["status"] == "skipped"]
-    checks = sum(r["checks"] for r in results)
+    began = time.time()
+    if jobs == 1:
+        for scenario in scenarios:
+            log(f"\n=== {scenario.name}: {scenario.probe}")
+            result = attempt(scenario)
+            results[scenario.name] = result
+            details(result)
+            if args.fail_fast and result["status"] in BAD:
+                break
+    else:
+        log(f"running {jobs} scenarios at a time")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+            futures = {pool.submit(attempt, s): s for s in scenarios}
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                results[result["name"]] = result
+                # as a block: with scenarios running at the same time, one's
+                # lines must not be scattered among the others'
+                log(f"\n=== {result['name']}: {futures[future].probe}")
+                details(result)
+                if args.fail_fast and result["status"] in BAD:
+                    # stop launching new scenarios; the running ones still finish
+                    for pending in futures:
+                        pending.cancel()
+                    break
+            # whatever finished while we were breaking out still gets reported
+            for future, scenario in futures.items():
+                if future.cancelled():
+                    results[scenario.name] = {"name": scenario.name, "status": "skipped",
+                                              "checks": 0, "failed": 0, "output": ""}
+                elif scenario.name not in results:
+                    result = future.result()
+                    results[scenario.name] = result
+                    log(f"\n=== {result['name']}: {scenario.probe}")
+                    details(result)
+
+    ordered = [results[s.name] for s in scenarios if s.name in results]
+    bad = [r for r in ordered if r["status"] in BAD]
+    skipped = [r for r in ordered if r["status"] == "skipped"]
+    checks = sum(r["checks"] for r in ordered)
     log("\n" + "=" * 68)
-    for r in results:
+    for r in ordered:
         name = r["name"]
         mark = {"ok": "ok", "skipped": "skipped"}.get(r["status"], r["status"].upper())
         log(f"  {name:12} {mark:8} {r['checks']:4} checks"
             + (f", {r['failed']} failed" if r["failed"] else ""))
-    log(f"  {'total':12} {checks} checks in {len(results)} scenarios"
-        + (f", {len(skipped)} skipped" if skipped else ""))
+    log(f"  {'total':12} {checks} checks in {len(ordered)} scenarios"
+        + (f", {len(skipped)} skipped" if skipped else "")
+        + f" ({time.time() - began:.0f}s)")
     log(f"  logs and screenshots: {WORK}")
     return 1 if bad else 0
 

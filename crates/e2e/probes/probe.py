@@ -13,7 +13,7 @@ from selenium.webdriver.firefox.service import Service
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-URL = "http://127.0.0.1:8080/"
+URL = os.environ.get("PROBE_URL", "http://127.0.0.1:8080/")
 SHOTS = os.path.join(os.environ.get("E2E_WORK") or "/tmp/web-desktop-e2e", "shots")
 
 os.makedirs(SHOTS, exist_ok=True)

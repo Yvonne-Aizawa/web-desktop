@@ -1,5 +1,5 @@
 
-import json, time
+import json, os, time
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -10,7 +10,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 opts = Options(); opts.add_argument("--headless"); opts.add_argument("--window-size=1400,900")
 d = webdriver.Firefox(options=opts); d.set_window_size(1400, 900)
 try:
-    d.get("http://127.0.0.1:8080/")
+    d.get(os.environ.get("PROBE_URL", "http://127.0.0.1:8080/"))
     WebDriverWait(d, 30).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".taskbar")))
     time.sleep(1.5)
     d.execute_script("""

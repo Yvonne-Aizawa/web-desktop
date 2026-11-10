@@ -43,7 +43,7 @@ try:
     # Handing a file to the editor is a *read*, so it stays available here; the
     # editor is what turns read-only on for itself.
     handoff = [b for b in d.find_elements(By.CSS_SELECTOR, ".preview-head .ghost-btn")
-               if b.is_displayed() and "Open with" in b.text]
+               if b.is_displayed() and "Open in" in b.text]
     check("opening in the editor is still offered", len(handoff) == 1, str([b.text for b in handoff]))
     handoff[0].click()
     time.sleep(2.0)

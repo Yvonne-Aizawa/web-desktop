@@ -4,6 +4,7 @@ import os
 import subprocess
 WORK = os.environ.get("E2E_WORK") or "/tmp/web-desktop-e2e"
 from selenium import webdriver
+from selenium.webdriver import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.firefox.options import Options
@@ -59,7 +60,32 @@ def notice():
     return els[0].text if els else ""
 
 def editor():
-    return driver.find_element(By.CSS_SELECTOR, ".editor-box")
+    """The editing box of the Text Editor window."""
+    return driver.find_element(By.CSS_SELECTOR, ".window .editor .editor-textarea")
+
+def editor_status():
+    return driver.find_element(By.CSS_SELECTOR, ".window .editor .editor-status").text
+
+def editor_notice():
+    els = driver.find_elements(By.CSS_SELECTOR, ".window .editor .editor-notice")
+    return els[0].text if els else ""
+
+def raise_app(title):
+    """Bring a window to the front through the taskbar, the way a user would."""
+    for b in driver.find_elements(By.CSS_SELECTOR, ".task-btn"):
+        if b.get_attribute("title") == title:
+            b.click()
+            time.sleep(0.8)
+            return
+    raise AssertionError(f"no taskbar button for {title}: "
+                         + str([b.get_attribute("title") for b in driver.find_elements(By.CSS_SELECTOR, ".task-btn")]))
+
+def handoff_button():
+    """The preview pane's button for handing the selected file to its app."""
+    for b in driver.find_elements(By.CSS_SELECTOR, ".preview-head .ghost-btn"):
+        if b.text == "Open in Text Editor":
+            return b
+    return None
 
 def type_name(text):
     box = driver.find_element(By.CSS_SELECTOR, ".prompt-input")
@@ -90,29 +116,39 @@ try:
     row("edited").click()
     time.sleep(1.0)
     btn("File").click()
-    WebDriverWait(driver, 5).until(EC.visibility_of_element_located((By.CSS_SELECTOR, ".files-prompt")))
+    WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".files-prompt")))
     type_name("draft.txt")
     check("new file appears in the folder", "draft.txt" in rows(), str(rows()))
 
     row("draft.txt").click()
     time.sleep(1.0)
-    check("an empty text file opens an editor", len(driver.find_elements(By.CSS_SELECTOR, ".editor-box")) == 1)
+    check("one click selects it and shows a preview",
+          driver.find_element(By.CSS_SELECTOR, ".preview-head .preview-name").text == "draft.txt",
+          driver.find_element(By.CSS_SELECTOR, ".preview-head .preview-name").text)
+    ActionChains(driver).double_click(row("draft.txt")).perform()
+    WebDriverWait(driver, 15).until(
+        lambda d: d.find_elements(By.CSS_SELECTOR, ".window .editor .editor-textarea"))
+    check("an empty text file opens an editor",
+          len(driver.find_elements(By.CSS_SELECTOR, ".window .editor")) == 1
+          and len(driver.find_elements(By.CSS_SELECTOR, ".window .editor .editor-textarea")) == 1)
+    check("with a tab named after the file",
+          "draft.txt" in [t.find_element(By.CSS_SELECTOR, ".tab-name").text
+                          for t in driver.find_elements(By.CSS_SELECTOR, ".editor-tab")],
+          str([t.text for t in driver.find_elements(By.CSS_SELECTOR, ".editor-tab")]))
     box = editor()
     box.click()
     box.send_keys("hello from the editor\nsecond line\n")
     time.sleep(0.4)
-    check("typing marks the buffer unsaved",
-          "unsaved" in driver.find_element(By.CSS_SELECTOR, ".editor-bar").text,
-          driver.find_element(By.CSS_SELECTOR, ".editor-bar").text.replace("\n", " / "))
+    check("typing marks the buffer unsaved", "unsaved" in editor_status(),
+          editor_status().replace("\n", " / "))
 
     # Save with Ctrl+S, the way the toolbar advertises it
     box.send_keys(Keys.CONTROL, "s")
     time.sleep(1.2)
     check("Ctrl+S saves", open(f"{ROOT}/edited/draft.txt").read() == "hello from the editor\nsecond line\n",
           repr(open(f"{ROOT}/edited/draft.txt").read()[:40]))
-    check("the unsaved marker is gone",
-          "unsaved" not in driver.find_element(By.CSS_SELECTOR, ".editor-bar").text)
-    check("the save is reported", "Saved" in notice(), notice())
+    check("the unsaved marker is gone", "unsaved" not in editor_status(), editor_status())
+    check("the save is reported", "Saved" in editor_notice(), editor_notice())
 
     # edit again and save with the button
     box.click()
@@ -125,24 +161,38 @@ try:
           open(f"{ROOT}/edited/draft.txt").read().endswith("third\n"),
           repr(open(f"{ROOT}/edited/draft.txt").read()[-20:]))
 
-    # revert
+    # Discard unsaved changes: close the tab, confirm, then reopen the file —
+    # what the editor offers instead of a Revert button.
     box.click()
     box.send_keys(Keys.END)
     box.send_keys("scratch")
     time.sleep(0.3)
-    btn("Revert", ".editor-bar").click()
+    close = driver.find_element(By.CSS_SELECTOR, ".editor-tab.active .tab-close")
+    close.click()
     time.sleep(0.3)
-    check("revert restores what is on disk", "scratch" not in editor().get_attribute("value"),
+    check("closing a dirty tab asks first",
+          close.text == "discard?" and "unsaved changes" in editor_notice(),
+          f"{close.text!r} / {editor_notice()}")
+    close.click()
+    WebDriverWait(driver, 10).until(
+        lambda d: not d.find_elements(By.CSS_SELECTOR, ".window .editor .editor-textarea"))
+    raise_app("Files")
+    ActionChains(driver).double_click(row("draft.txt")).perform()
+    WebDriverWait(driver, 15).until(
+        lambda d: d.find_elements(By.CSS_SELECTOR, ".window .editor .editor-textarea"))
+    check("revert restores what is on disk",
+          "scratch" not in editor().get_attribute("value"),
           repr(editor().get_attribute("value")[-20:]))
-    check("and it is no longer dirty",
-          "unsaved" not in driver.find_element(By.CSS_SELECTOR, ".editor-bar").text)
+    check("and it is no longer dirty", "unsaved" not in editor_status(), editor_status())
     driver.save_screenshot(f"{SHOTS}/61-editor.png")
 
     # ---------------- rename ----------------
-    check("a selected file offers rename", btn("Rename") is not None or btn("✎") is not None,
+    # The toolbar also has "✎ Rename this folder", so the file's own buttons are
+    # scoped to the preview pane.
+    raise_app("Files")
+    check("a selected file offers rename", btn("Rename", ".preview-actions") is not None,
           str([b.text for b in driver.find_elements(By.CSS_SELECTOR, ".preview-actions .ghost-btn")]))
-    rename = btn("Rename") or btn("✎")
-    rename.click()
+    btn("Rename", ".preview-actions").click()
     WebDriverWait(driver, 5).until(EC.visibility_of_element_located((By.CSS_SELECTOR, ".files-prompt")))
     type_name("renamed.txt")
     check("the file is renamed", "renamed.txt" in rows() and "draft.txt" not in rows(), str(rows()))
@@ -161,8 +211,9 @@ try:
     # ---------------- delete, which now goes to the trash ----------------
     row("upload-me.bin").click()
     time.sleep(0.8)
-    delete = btn("Delete")
-    check("a selected file offers delete", delete is not None)
+    delete = btn("Delete", ".preview-actions")
+    check("a selected file offers delete", delete is not None,
+          str([b.text for b in driver.find_elements(By.CSS_SELECTOR, ".preview-actions .ghost-btn")]))
     delete.click()
     time.sleep(1.5)
     # One click, no dialog: the trash makes it reversible, and the undo bar says so.
@@ -182,23 +233,17 @@ try:
           driver.find_element(By.CSS_SELECTOR, ".side-fine").text[:60])
 
     # ---------------- hand a file to the Text Editor ----------------
-    subprocess.run(["mkdir", "-p", f"{ROOT}/edited"], capture_output=True)
     open(f"{ROOT}/edited/handoff.txt", "w").write("handed over\n")
-    for _ in range(4):
-        btn("⟳").click()
-        time.sleep(0.8)
     driver.find_element(By.CSS_SELECTOR, ".files-bar .ghost-btn[title='Reload this folder']").click()
     time.sleep(1.2)
     row("handoff.txt").click()
     time.sleep(1.0)
-    edit = None
-    for b in driver.find_elements(By.CSS_SELECTOR, ".preview-head .ghost-btn"):
-        if b.text == "✎ Edit":
-            edit = b
+    edit = handoff_button()
     check("Files offers to open a file in the Text Editor", edit is not None and edit.is_displayed(),
           str([b.text for b in driver.find_elements(By.CSS_SELECTOR, ".preview-head .ghost-btn")]))
     edit.click()
-    time.sleep(2.0)
+    WebDriverWait(driver, 15).until(
+        lambda d: d.find_elements(By.CSS_SELECTOR, ".window .editor .editor-textarea"))
     check("the editor opens with that file in a tab",
           "handoff.txt" in [t.find_element(By.CSS_SELECTOR, ".tab-name").text
                             for t in driver.find_elements(By.CSS_SELECTOR, ".editor-tab")],
@@ -207,83 +252,10 @@ try:
           driver.find_element(By.CSS_SELECTOR, ".editor-textarea").get_attribute("value") == "handed over\n",
           repr(driver.find_element(By.CSS_SELECTOR, ".editor-textarea").get_attribute("value")))
     # the editor is already open now: a second handoff must still land
-    driver.find_elements(By.CSS_SELECTOR, ".task-btn")[1].click()   # raise Files
-    time.sleep(0.8)
-    for b in driver.find_elements(By.CSS_SELECTOR, ".preview-head .ghost-btn"):
-        if b.text == "✎ Edit":
-            b.click()
-    time.sleep(1.5)
-    check("a second handoff raises the same window",
-          len(driver.find_elements(By.CSS_SELECTOR, ".window .editor")) == 1,
-          str(len(driver.find_elements(By.CSS_SELECTOR, ".window .editor"))))
-
-    # ---------------- hand a file to the Text Editor ----------------
-    subprocess.run(["mkdir", "-p", f"{ROOT}/edited"], capture_output=True)
-    open(f"{ROOT}/edited/handoff.txt", "w").write("handed over\n")
-    for _ in range(4):
-        btn("⟳").click()
-        time.sleep(0.8)
-    driver.find_element(By.CSS_SELECTOR, ".files-bar .ghost-btn[title='Reload this folder']").click()
-    time.sleep(1.2)
+    raise_app("Files")
     row("handoff.txt").click()
-    time.sleep(1.0)
-    edit = None
-    for b in driver.find_elements(By.CSS_SELECTOR, ".preview-head .ghost-btn"):
-        if b.text == "✎ Edit":
-            edit = b
-    check("Files offers to open a file in the Text Editor", edit is not None and edit.is_displayed(),
-          str([b.text for b in driver.find_elements(By.CSS_SELECTOR, ".preview-head .ghost-btn")]))
-    edit.click()
-    time.sleep(2.0)
-    check("the editor opens with that file in a tab",
-          "handoff.txt" in [t.find_element(By.CSS_SELECTOR, ".tab-name").text
-                            for t in driver.find_elements(By.CSS_SELECTOR, ".editor-tab")],
-          str([t.text for t in driver.find_elements(By.CSS_SELECTOR, ".editor-tab")]))
-    check("its contents came with it",
-          driver.find_element(By.CSS_SELECTOR, ".editor-textarea").get_attribute("value") == "handed over\n",
-          repr(driver.find_element(By.CSS_SELECTOR, ".editor-textarea").get_attribute("value")))
-    # the editor is already open now: a second handoff must still land
-    driver.find_elements(By.CSS_SELECTOR, ".task-btn")[1].click()   # raise Files
-    time.sleep(0.8)
-    for b in driver.find_elements(By.CSS_SELECTOR, ".preview-head .ghost-btn"):
-        if b.text == "✎ Edit":
-            b.click()
-    time.sleep(1.5)
-    check("a second handoff raises the same window",
-          len(driver.find_elements(By.CSS_SELECTOR, ".window .editor")) == 1,
-          str(len(driver.find_elements(By.CSS_SELECTOR, ".window .editor"))))
-
-    # ---------------- hand a file to the Text Editor ----------------
-    subprocess.run(["mkdir", "-p", f"{ROOT}/edited"], capture_output=True)
-    open(f"{ROOT}/edited/handoff.txt", "w").write("handed over\n")
-    for _ in range(4):
-        btn("⟳").click()
-        time.sleep(0.8)
-    driver.find_element(By.CSS_SELECTOR, ".files-bar .ghost-btn[title='Reload this folder']").click()
-    time.sleep(1.2)
-    row("handoff.txt").click()
-    time.sleep(1.0)
-    edit = None
-    for b in driver.find_elements(By.CSS_SELECTOR, ".preview-head .ghost-btn"):
-        if b.text == "✎ Edit":
-            edit = b
-    check("Files offers to open a file in the Text Editor", edit is not None and edit.is_displayed(),
-          str([b.text for b in driver.find_elements(By.CSS_SELECTOR, ".preview-head .ghost-btn")]))
-    edit.click()
-    time.sleep(2.0)
-    check("the editor opens with that file in a tab",
-          "handoff.txt" in [t.find_element(By.CSS_SELECTOR, ".tab-name").text
-                            for t in driver.find_elements(By.CSS_SELECTOR, ".editor-tab")],
-          str([t.text for t in driver.find_elements(By.CSS_SELECTOR, ".editor-tab")]))
-    check("its contents came with it",
-          driver.find_element(By.CSS_SELECTOR, ".editor-textarea").get_attribute("value") == "handed over\n",
-          repr(driver.find_element(By.CSS_SELECTOR, ".editor-textarea").get_attribute("value")))
-    # the editor is already open now: a second handoff must still land
-    driver.find_elements(By.CSS_SELECTOR, ".task-btn")[1].click()   # raise Files
-    time.sleep(0.8)
-    for b in driver.find_elements(By.CSS_SELECTOR, ".preview-head .ghost-btn"):
-        if b.text == "✎ Edit":
-            b.click()
+    time.sleep(0.5)
+    handoff_button().click()
     time.sleep(1.5)
     check("a second handoff raises the same window",
           len(driver.find_elements(By.CSS_SELECTOR, ".window .editor")) == 1,

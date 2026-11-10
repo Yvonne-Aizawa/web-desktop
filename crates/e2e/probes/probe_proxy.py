@@ -8,6 +8,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.firefox.options import Options
 
 BASE = os.environ.get("PROBE_URL", "http://127.0.0.1:8096/")
+UPSTREAM = os.environ.get("UPSTREAM", "http://127.0.0.1:8099")
 opts = Options(); opts.add_argument("--headless"); opts.add_argument("--window-size=1200,900")
 d = webdriver.Firefox(options=opts)
 ok = []
@@ -28,22 +29,25 @@ try:
     WebDriverWait(d, 30).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".taskbar")))
     time.sleep(2.0)
 
-    r = proxied("http://127.0.0.1:8099/cors-test")
+    r = proxied(f"{UPSTREAM}/cors-test")
     check("the page can read a body with no CORS headers via the proxy",
           r.get("status") == 200 and '"ok": true' in r.get("body", ""), str(r)[:90])
-    r = proxied("http://127.0.0.1:8099/redirect")
+    r = proxied(f"{UPSTREAM}/redirect")
     check("a redirect is followed for the caller too", r.get("status") == 200, str(r)[:60])
     r = proxied("https://example.com/")
     check("a host outside the list is refused, with the reason",
           r.get("status") == 403 and "WEB_DESKTOP_PROXY_HOSTS" in r.get("body", ""), str(r)[:90])
 
     # the catalog advertises the policy, which is how Settings and an app can tell
-    info = d.execute_script("""
+    # (execute_async_script: the fetch resolves only after the callback fires)
+    info = d.execute_async_script("""
         const cb = arguments[arguments.length - 1];
         fetch('/api/catalog').then(r => r.json()).then(j => cb(j.proxy)).catch(e => cb({error: String(e)}));
     """)
+    # the policy the server was started with: the upstream's host, private allowed
+    expected_host = urllib.parse.urlparse(UPSTREAM).hostname
     check("the catalog advertises the proxy policy",
-          info.get("hosts") == ["127.0.0.1", "localhost"] and info.get("allow_private") is True, str(info)[:80])
+          info.get("hosts") == [expected_host] and info.get("allow_private") is True, str(info)[:80])
 finally:
     d.quit()
 print(f"\n{sum(ok)}/{len(ok)} proxy-in-the-page checks passed")

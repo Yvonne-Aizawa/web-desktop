@@ -52,7 +52,10 @@ def pane():
     return driver.find_elements(By.CSS_SELECTOR, ".window .files")[0]
 
 def preview_buttons():
-    return {b.text.strip() for b in pane().find_elements(By.CSS_SELECTOR, ".preview-actions .ghost-btn")}
+    # What is *offered*: locked files render the buttons but hide them, and a
+    # hidden button's text reads as empty — so look at what is displayed.
+    return {b.text.strip() for b in pane().find_elements(By.CSS_SELECTOR, ".preview-actions .ghost-btn")
+            if b.is_displayed()}
 
 def open_files():
     driver.find_element(By.CSS_SELECTOR, ".start-btn").click()
@@ -247,6 +250,9 @@ try:
     check("a protected folder offers no way to create anything",
           not any("Folder" in l or "File" in l or "Upload" in l for l in labels), str(labels))
     check("and says why, on screen", "read-only folder" in pane().text, "")
+    row("gallery").click(); time.sleep(0.8)   # precious.png lives inside Lumina/gallery
+    check("the read-only fence covers folders inside the protected one too",
+          "read-only" in pane().text, "")
     row("precious.png").click(); time.sleep(0.8)
     check("a file inside it is locked: no rename, no delete",
           preview_buttons() == set(), str(preview_buttons()))
@@ -262,7 +268,8 @@ try:
     check("the protected folder itself cannot be deleted from the UI",
           preview_buttons() == set(), str(preview_buttons()))
     check("nothing in Lumina was touched",
-          open(os.path.join(ROOT, "Lumina/precious.png")).read().strip() == "keep me")
+          open(os.path.join(ROOT, "Lumina/gallery/precious.png")).read().strip()
+          == "the one file that must survive")
 
 finally:
     shot("trash_final")

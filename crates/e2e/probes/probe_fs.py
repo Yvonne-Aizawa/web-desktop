@@ -1,5 +1,6 @@
 import os, sys, time
 from selenium import webdriver
+from selenium.common.exceptions import StaleElementReferenceException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.firefox.options import Options
@@ -40,6 +41,16 @@ def wait_rows():
     WebDriverWait(driver, 20).until(lambda d: len(d.find_elements(By.CSS_SELECTOR, ".files-list .row")) > 0)
     time.sleep(0.3)
 
+def wait_for(cond, timeout=20):
+    """Wait for an async UI state to arrive; mid-rerender stale elements just retry."""
+    def ok(_d):
+        try:
+            return cond()
+        except StaleElementReferenceException:
+            return False
+    WebDriverWait(driver, timeout).until(ok)
+    time.sleep(0.3)
+
 def crumbs():
     return [c.text for c in driver.find_elements(By.CSS_SELECTOR, ".crumb-seg")]
 
@@ -55,12 +66,6 @@ def open_app(name):
             it.click()
             break
     time.sleep(1.2)
-
-def focus_window(i):
-    btns = driver.find_elements(By.CSS_SELECTOR, ".task-btn")
-    if "active" not in (btns[i].get_attribute("class") or ""):
-        btns[i].click()
-        time.sleep(0.5)
 
 def files_pane():
     return driver.find_elements(By.CSS_SELECTOR, ".window .files")[0]
@@ -162,23 +167,38 @@ try:
     shot("22-files-binary")
 
     # ---------- navigate through a symlink inside the root, then Up ----------
+    # The server canonicalizes listing paths, so a symlink reports its target, and
+    # the client adopts that path (files.rs): browsing testdir/notes-link lands in
+    # the real "notes" folder, and the crumbs name the directory being shown rather
+    # than the link that opened it.
     row("notes-link").click()
-    wait_rows()
-    check("symlinked folder is browsable", crumbs() == ["Sandbox", "testdir", "notes-link"], str(crumbs()))
+    wait_for(lambda: "todo.md" in row_names())
+    time.sleep(0.5)  # let the canonicalization refetch settle before using the toolbar
+    check("symlinked folder is browsable",
+          row_names() == ["scratch.rs", "todo.md"] and crumbs() == ["Sandbox", "notes"],
+          str(crumbs()) + " " + str(row_names()))
     files_pane().find_elements(By.CSS_SELECTOR, ".files-bar .ghost-btn")[0].click()
-    wait_rows()
-    check("up button works", crumbs() == ["Sandbox", "testdir"], str(crumbs()))
+    wait_for(lambda: "README.txt" in row_names())
+    check("up button works",
+          crumbs() == ["Sandbox"] and "README.txt" in row_names(), str(crumbs()))
 
     # ---------- reload ----------
+    row("testdir").click()
+    wait_for(lambda: crumbs() == ["Sandbox", "testdir"] and "notes-link" in row_names())
     before = row_names()
-    files_pane().find_elements(By.CSS_SELECTOR, ".files-bar .ghost-btn")[1].click()
+    # The ⟳ button is found by title, not index: with a writable root the toolbar
+    # also holds rename/delete/new/upload buttons, shifting the ghost-btn order.
+    files_pane().find_element(
+        By.CSS_SELECTOR, '.files-bar .ghost-btn[title="Reload this folder"]').click()
     time.sleep(1.0)
-    check("reload keeps the same folder", row_names() == before and crumbs() == ["Sandbox", "testdir"])
+    check("reload keeps the same folder",
+          row_names() == before and crumbs() == ["Sandbox", "testdir"], str(crumbs()))
 
     # ---------- the terminal reads the same folder ----------
+    # Keep the Terminal on top: it opens cascaded fully inside the Files window,
+    # so raising Files would cover the terminal input and intercept the click.
     open_app("Terminal")
     time.sleep(0.8)
-    focus_window(0)
     term("ls", "")
     t = term_text()
     check("terminal ls lists the sandbox", "notes/" in t and "README.txt" in t, t.splitlines()[-1][:60])

@@ -6,6 +6,7 @@ driven by Selenium, against a real server, checking what is actually on the scre
 what is actually on disk.
 
     cargo xtask e2e                     # build everything, then run every scenario
+    cargo xtask e2e --jobs 8            # ... eight at a time, instead of the default four
     cargo xtask e2e --list              # what there is
     cargo xtask e2e --only trash,files  # a couple, while working on them
     cargo xtask e2e --no-build          # skip the Rust and trunk builds
@@ -35,10 +36,12 @@ can be run by hand against a server you already have up:
     serve/            stand-in servers used as fixtures: a skewed catalog, a
                       broken catalog, an offline dist, and a third-party API
 
-Each scenario gets its own ports and its own fixture root, and its servers are stopped
-afterwards — including on failure — so a run leaves no stray processes and no state
-behind for the next one. The server is started from `target/e2e/work`, where there is no
-`.env`, so your local configuration cannot make the suite pass or fail.
+Each scenario gets its own ports (handed out from 8200 at run time) and its own fixture
+root under `target/e2e/work/<scenario>`, and its servers are stopped afterwards —
+including on failure — so scenarios are independent and several run at once (four by
+default, `--jobs` to change), and a run leaves no stray processes and no state behind
+for the next one. The server is started from its scenario's work directory, where there
+is no `.env`, so your local configuration cannot make the suite pass or fail.
 
 ## Scenarios
 

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Check what the shell actually costs over the wire."""
-import sys, urllib.request, urllib.error
+import os, re, sys, gzip, brotli, urllib.request, urllib.error
 
-BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8080"
+BASE = (sys.argv[1] if len(sys.argv) > 1
+        else os.environ.get("PROBE_URL", "http://127.0.0.1:8080")).rstrip("/")
 ok = []
 def check(name, cond, extra=""):
     ok.append(cond)
@@ -18,15 +19,29 @@ def get(path, encoding=None):
     except urllib.error.HTTPError as e:
         return e.code, e.read(), {k.lower(): v for k, v in e.headers.items()}
 
-identity = get("/client_bg.wasm")[1]
-check("wasm is small enough to ship", len(identity) < 1_200_000, f"{len(identity)} bytes raw")
+# the dist uses hash-named assets, so read the real names out of the shell
+html = get("/")[1].decode("utf-8", "replace")
+def asset(pattern):
+    m = re.search(r"['\"/]([A-Za-z0-9_.-]+" + pattern + r")['\"]", html)
+    if not m:
+        raise RuntimeError(f"index.html references no {pattern} asset")
+    return "/" + m.group(1)
+WASM = asset(r"\.wasm")
+JS = asset(r"\.js")
+
+identity = get(WASM)[1]
+ship = get(WASM, "br")[1]
+check("wasm is small enough to ship", len(ship) < 1_200_000,
+      f"{len(ship)} bytes over the wire, {len(identity)} raw")
 
 for enc in ("gzip", "br"):
-    s, body, h = get("/client_bg.wasm", enc)
+    s, body, h = get(WASM, enc)
     ratio = len(identity) / max(1, len(body))
     check(f"wasm served as {enc}", s == 200 and h.get("content-encoding") == enc,
           f"{h.get('content-encoding')} {len(body)} bytes, {ratio:.1f}x smaller")
-    check(f"{enc} body decompresses to the same bytes", body[:4] == b"\0asm", str(body[:4]))
+    plain = gzip.decompress(body) if enc == "gzip" else brotli.decompress(body)
+    check(f"{enc} body decompresses to the same bytes", plain == identity,
+          f"{len(plain)} bytes back")
 
 s, body, h = get("/", "gzip")
 check("the html shell is compressed", h.get("content-encoding") == "gzip", h.get("content-encoding", "none"))
@@ -37,7 +52,7 @@ check("json is compressed", h.get("content-encoding") == "gzip", h.get("content-
 s, body, h = get("/api/fs/preview?path=notes%2Ftodo.md", "gzip")
 check("text previews are compressed", h.get("content-encoding") == "gzip", h.get("content-encoding", "none"))
 
-total = len(get("/client_bg.wasm", "br")[1]) + len(get("/client.js", "br")[1])
+total = len(ship) + len(get(JS, "br")[1])
 print(f"\nfirst load of the shell: ~{total // 1024} KB (brotli, wasm + js)")
 print(f"{sum(ok)}/{len(ok)} compression checks passed")
 sys.exit(0 if all(ok) else 1)

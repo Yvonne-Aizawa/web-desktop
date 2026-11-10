@@ -16,7 +16,7 @@ ok = []
 def check(n, c, x=""):
     ok.append(c); print(("PASS  " if c else "FAIL  ") + n + (f"   [{x}]" if x else ""), flush=True)
 try:
-    d.get("http://127.0.0.1:8096/")
+    d.get(os.environ.get("PROBE_URL", "http://127.0.0.1:8096/"))
     WebDriverWait(d, 30).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".taskbar")))
     time.sleep(2.5)
     status = d.find_element(By.CSS_SELECTOR, ".tray-dot").get_attribute("title") or ""

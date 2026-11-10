@@ -115,6 +115,14 @@ try:
     # ---------------- a corrupted bundle is refused ----------------
     shutil.copytree(f"{APPS}/0.1.0", f"{APPS}/0.1.1", dirs_exist_ok=True)
     wasm = f"{APPS}/0.1.1/app_bg.wasm"
+    # The server negotiates the precompressed siblings (`cargo xtask precompress`:
+    # app_bg.wasm.br/.gz) before the plain file, and the copy above brought the
+    # originals along; corrupting only app_bg.wasm would go unnoticed because the
+    # browser would still be handed the original bytes. Removing the siblings makes
+    # ServeDir fall back to the plain, tampered file.
+    for sibling in (wasm + ".br", wasm + ".gz"):
+        if os.path.exists(sibling):
+            os.remove(sibling)
     with open(wasm, "r+b") as fh:
         fh.seek(2000)
         fh.write(b"\x00\xde\xad\xbe\xef")

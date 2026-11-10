@@ -1,6 +1,6 @@
 
 """A stand-in third-party API: no CORS headers, a redirect, and a big body."""
-import http.server, socketserver, json
+import http.server, socketserver, json, sys
 class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def do_GET(self):
@@ -20,4 +20,4 @@ class H(http.server.BaseHTTPRequestHandler):
             self.send_response(404); self.end_headers()
 class S(socketserver.ThreadingTCPServer):
     allow_reuse_address = True; daemon_threads = True
-S(("127.0.0.1", 8099), H).serve_forever()
+S(("127.0.0.1", int(sys.argv[1]) if len(sys.argv) > 1 else 8099), H).serve_forever()

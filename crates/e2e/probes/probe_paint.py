@@ -19,7 +19,7 @@ def check(n, c, x=""):
     ok.append(c); print(("PASS  " if c else "FAIL  ") + n + (f"   [{x}]" if x else ""))
 
 try:
-    d.get("http://127.0.0.1:8080/")
+    d.get(os.environ.get("PROBE_URL", "http://127.0.0.1:8080/"))
     WebDriverWait(d, 30).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".taskbar")))
     time.sleep(1.5)
     d.find_element(By.CSS_SELECTOR, ".start-btn").click(); time.sleep(0.5)
