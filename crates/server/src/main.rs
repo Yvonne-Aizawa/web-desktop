@@ -44,10 +44,28 @@
 //!   WEB_DESKTOP_AI_MODELS
 //!                     comma-separated models an app may ask for. Defaults to just
 //!                     WEB_DESKTOP_AI_MODEL.
+//!   WEB_DESKTOP_IMAGE_URL
+//!                     base URL of an OpenAI-compatible image provider, e.g.
+//!                     `https://api.melious.ai/v1`. Unset means the image gateway is
+//!                     off. Configured separately from WEB_DESKTOP_AI_URL, so chat and
+//!                     images can be different services.
+//!   WEB_DESKTOP_IMAGE_KEY
+//!                     the image provider's key. Read here, never logged, never sent
+//!                     to the browser.
+//!   WEB_DESKTOP_IMAGE_MODEL
+//!                     the image model a request gets when it names none
+//!   WEB_DESKTOP_IMAGE_MODELS
+//!                     comma-separated image models an app may ask for. Defaults to
+//!                     just WEB_DESKTOP_IMAGE_MODEL.
+//!   WEB_DESKTOP_IMAGE_SIZES
+//!                     comma-separated `WxH` sizes an app may ask for. Defaults to the
+//!                     provider's documented set.
 
 mod ai;
 mod apps;
 mod fs;
+mod images;
+mod provider;
 mod proxy;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
@@ -78,6 +96,9 @@ pub struct AppState {
     proxy: Option<proxy::Proxy>,
     /// Chat gateway; `None` when no provider URL is configured.
     ai: Option<ai::Ai>,
+    /// Image gateway; `None` when no image provider URL is configured. Separate from
+    /// [`Self::ai`] because the two may be different services on different keys.
+    images: Option<images::Images>,
     /// `None` when the filesystem API is switched off or its root is unusable.
     fs: Option<FsRoot>,
 }
@@ -156,6 +177,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // The image gateway, configured on its own. Same shape as the chat gateway and the
+    // same reason for being here rather than in the app: the key is the server's.
+    let images = images::Images::from_env();
+    if let Some(images) = &images {
+        let info = images.info();
+        tracing::info!(
+            "images: {} (models: {}; sizes: {})",
+            images.base_url(),
+            if info.models.is_empty() {
+                "none configured".to_owned()
+            } else {
+                info.models.join(", ")
+            },
+            info.sizes.join(", ")
+        );
+        if !images.has_key() {
+            tracing::warn!(
+                "images: WEB_DESKTOP_IMAGE_KEY is not set; a hosted provider will refuse \
+                 every request"
+            );
+        }
+        if !info.enabled() {
+            tracing::warn!("images: no model configured; set WEB_DESKTOP_IMAGE_MODEL");
+        }
+        catalog.images = info;
+    } else {
+        tracing::info!(
+            "images off: set WEB_DESKTOP_IMAGE_URL=https://api.melious.ai/v1 (and \
+             WEB_DESKTOP_IMAGE_KEY) to let apps generate images"
+        );
+    }
+
     // Served apps are appended to the compiled-in ones. They live under
     // /apps/<id>/<version>/, which is immutable, so the cache policy can treat
     // everything there as content-addressed.
@@ -202,6 +255,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         apps_dir: apps_dir.is_dir().then_some(apps_dir.clone()),
         proxy,
         ai,
+        images,
         fs: fs_root,
     });
 
@@ -210,6 +264,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(API_CATALOG, get(catalog_handler))
         .merge(fs::router())
         .merge(ai::router())
+        .merge(images::router())
         // The proxy makes outbound requests on this machine's behalf, so it gets the
         // same cross-site guard the file API has: a random page must not be able to
         // spend the user's network position.

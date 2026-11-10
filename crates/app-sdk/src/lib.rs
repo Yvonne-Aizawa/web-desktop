@@ -41,10 +41,10 @@
 //!
 //! To read a cross-origin URL, turn on the `fetch` feature (see [`fetch`]): the request
 //! goes through the server, because the browser will not let an app read a response
-//! from a host without CORS headers. Three more features are opt-in the same way:
+//! from a host without CORS headers. Four more features are opt-in the same way:
 //! [`ai`] for a chat model the server talks to on the app's behalf — add `ai-stream` to
-//! read the answer as it arrives instead of waiting for all of it — and [`fs`] for the
-//! shell's fenced file API.
+//! read the answer as it arrives instead of waiting for all of it — [`image`] for an
+//! image model the same server talks to, and [`fs`] for the shell's fenced file API.
 //!
 //! An app needs `crate-type = ["cdylib"]` and three dependencies: this crate, plus
 //! `leptos` and `wasm-bindgen` — not by choice, but because `view!` expands to
@@ -58,6 +58,8 @@ mod context;
 pub mod fetch;
 #[cfg(feature = "fs")]
 pub mod fs;
+#[cfg(feature = "image")]
+pub mod image;
 // Only the request helpers need to build a query string, so this is not compiled for
 // an app that only holds a conversation.
 #[cfg(any(feature = "fetch", feature = "fs"))]
@@ -88,6 +90,8 @@ pub mod prelude {
     pub use crate::fetch;
     #[cfg(feature = "fs")]
     pub use crate::fs;
+    #[cfg(feature = "image")]
+    pub use crate::image;
     pub use crate::{Context, Size, Theme};
     pub use leptos;
     pub use leptos::prelude::*;

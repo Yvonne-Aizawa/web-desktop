@@ -1,0 +1,23 @@
+[package]
+name = "images"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# `image` is the point of the app: a prompt goes to `/api/images/generate` and base64
+# comes back. `fs` is where the pictures go — the same sandbox Files browses, under
+# `images/`, so the Gallery can look at them and the trash can bring them back.
+app-sdk = { workspace = true, features = ["image", "fs"] }
+
+# Not optional: the `view!` macro emits absolute `leptos::` paths, and the
+# `#[wasm_bindgen]` export needs its crate in scope.
+leptos = { version = "0.8", features = ["csr"] }
+wasm-bindgen = "0.2"
+# The timestamp that goes into a filename, and the textarea's own value.
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["HtmlTextAreaElement", "KeyboardEvent"] }

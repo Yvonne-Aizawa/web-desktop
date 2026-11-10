@@ -276,6 +276,11 @@ cp .env.example .env      # then edit
 | `WEB_DESKTOP_AI_KEY` | empty | The provider's key. Read from here, never sent to the browser |
 | `WEB_DESKTOP_AI_MODEL` | empty | The model a request gets when it names none |
 | `WEB_DESKTOP_AI_MODELS` | just `WEB_DESKTOP_AI_MODEL` | Models an app may ask for |
+| `WEB_DESKTOP_IMAGE_URL` | empty (off) | An OpenAI-compatible image provider the image gateway may call. Separate from `WEB_DESKTOP_AI_URL` |
+| `WEB_DESKTOP_IMAGE_KEY` | empty | The image provider's key. Read from here, never sent to the browser |
+| `WEB_DESKTOP_IMAGE_MODEL` | empty | The image model a request gets when it names none |
+| `WEB_DESKTOP_IMAGE_MODELS` | just `WEB_DESKTOP_IMAGE_MODEL` | Image models an app may ask for |
+| `WEB_DESKTOP_IMAGE_SIZES` | the provider's documented set | `WxH` sizes an app may ask for |
 | `WEB_DESKTOP_APPS` | `apps` | Where built app bundles live |
 | `WEB_DESKTOP_DIST` | `crates/client/dist` | Where the client bundle is served from |
 | `RUST_LOG` | `server=info` | Log filter |
@@ -593,15 +598,69 @@ side of a chunk boundary. That last one is why the buffer is a `Vec<u8>` and the
 on bytes: no UTF-8 continuation byte is `\n`, so slicing there can never cut a character
 in half, which a chunk-at-a-time `from_utf8` would.
 
+### Making pictures
+
+The chat gateway's argument again, and a deliberately separate module rather than a mode
+of it: an image provider is a different service with a different bill, its request and
+response are their own shape, and an operator may well want one provider for words and
+another for pictures. So `server::images` has its own configuration, its own allow-lists
+and its own concurrency cap:
+
+```text
+app ──POST /api/images/generate──▶ server ──POST {WEB_DESKTOP_IMAGE_URL}/images/generations──▶ provider
+```
+
+| Setting | Effect |
+| --- | --- |
+| *(default)* | **Off.** `/api/images/info` answers with an empty model list, and the app says so. |
+| `WEB_DESKTOP_IMAGE_URL` | The provider's base URL, e.g. `https://api.melious.ai/v1`. Any OpenAI-compatible image server will do. |
+| `WEB_DESKTOP_IMAGE_KEY` | The provider's key. Never logged, never sent to the browser. |
+| `WEB_DESKTOP_IMAGE_MODEL` | What a request gets when it names no model. The provider requires a model, so this is the one that matters. |
+| `WEB_DESKTOP_IMAGE_MODELS` | The models an app may ask for. Defaults to just the one above. |
+| `WEB_DESKTOP_IMAGE_SIZES` | The `WxH` sizes an app may ask for. Defaults to the provider's documented set. |
+
+The fence is the chat gateway's, for the same reason — the caller never names an address
+— with two additions that are specific to a picture: **the size is an allow-list too**
+(a larger image is a larger bill), and **the count is capped** at what the provider
+itself accepts. The response ceiling is far higher than a chat's, because one base64 PNG
+is hundreds of kilobytes and a batch is megabytes.
+
+The one thing the server adds on the way through is a **sniffed MIME type**. The provider
+returns `b64_json` and never says which format it produced — FLUX hands back JPEG unless
+asked otherwise, other models hand back whatever their runtime emits — so the server reads
+the file signature from the base64 *prefix* (base64 encodes three bytes at a time, so the
+encoding of the first bytes is a prefix of the whole encoding) and reports `image/png`,
+`image/jpeg`, `image/gif` or `image/webp`. That is what lets the app name the file
+`ship.png`, and lets Files and the Gallery treat the result as the picture it is. An
+unrecognised signature becomes `application/octet-stream`: saved and linked, but not drawn
+as a broken tile.
+
+#### The Images app
+
+`crates/apps/images` is a served app, and it writes: every generated image is saved under
+`images/` in the same sandbox Files browses, named from the prompt with a timestamp so it
+sorts and the Gallery can show it. The batch stays on screen whether or not the write
+succeeds — the picture was already paid for — and a read-only root shows up as
+`not saved: …` on the card rather than a crash. The sidebar is a view of `images/`, so a
+past generation is one click away, and removing one is the ordinary trash, so Files can put
+it back. The app offers the model, size, count and quality the server allows, and remembers
+what was chosen in `localStorage`.
+
+The request type is where image-to-image goes next: the provider documents `input_images`
+(base64 reference images) and the FLUX/SDXL extras (`steps`, `guidance`, `loras`) as
+top-level fields, and the server builds its body field by field, so each is one more
+explicit option rather than a passthrough map.
+
 ### Sample apps
 
-Three apps live in the repository, built with `cargo xtask build-app`:
+Four apps live in the repository, built with `cargo xtask build-app`:
 
 | App | Shows |
 | --- | --- |
 | `crates/apps/calculator` | A four-function calculator: signals, the host object, its own styles. |
 | `crates/apps/pokedex` | A random Pokémon from <https://pokeapi.co>: the proxy, and the SDK's `fetch`. |
 | `crates/apps/chat` | A conversation with a model the server talks to: the AI gateway, and the SDK's `ai` and `fs`. |
+| `crates/apps/images` | A generated picture the server fetches: the image gateway, and the SDK's `image` and `fs`. |
 
 The Pokédex is the one that exercises the network, and it needs the proxy to be told
 about the host:
@@ -792,6 +851,11 @@ That shape is load-bearing, so it is worth knowing why:
 * **No retry after a broken stream.** Text that arrived before a failure is kept and the
   failure is reported next to it, but the app does not try to pick the answer up where it
   stopped — the provider has no way to resume one.
+* **No image-to-image yet.** The Images app generates from a prompt only. The gateway is
+  shaped for the rest — the provider documents reference images and the FLUX/SDXL extras
+  as top-level fields — but the app has no way of picking a source picture and the server
+  does not yet bound one, which is what it must do before it accepts megabytes of
+  caller-supplied base64.
 
 Natural next steps: persist layout with `PUT /api/layout`, detect external edits by
 comparing mtime before saving, a WebSocket on a tokio `broadcast` channel to mirror

@@ -193,6 +193,47 @@ pub fn Settings() -> impl IntoView {
             </section>
 
             <section class="pane">
+                <h3>"AI images"</h3>
+                <Show
+                    when=move || desktop.images.get().enabled()
+                    fallback=move || {
+                        view! {
+                            <div class="kv">
+                                <span>"status"</span>
+                                <span class="badge badge-wait">"off"</span>
+                            </div>
+                            <p class="muted">
+                                "Apps cannot generate images. Point the server at an OpenAI-compatible image provider to enable it:"
+                            </p>
+                            <p class="path-value">
+                                "WEB_DESKTOP_IMAGE_URL=https://api.melious.ai/v1 WEB_DESKTOP_IMAGE_KEY=… WEB_DESKTOP_IMAGE_MODEL=…"
+                            </p>
+                        }
+                    }
+                >
+                    <div class="kv">
+                        <span>"status"</span>
+                        <span class="badge badge-ok">"on"</span>
+                    </div>
+                    <div class="kv">
+                        <span>"default model"</span>
+                        <span class="path-value">{move || desktop.images.get().default_model}</span>
+                    </div>
+                    <div class="kv">
+                        <span>"offered"</span>
+                        <span class="path-value">{move || desktop.images.get().models.join(", ")}</span>
+                    </div>
+                    <div class="kv">
+                        <span>"sizes"</span>
+                        <span class="path-value">{move || desktop.images.get().sizes.join(", ")}</span>
+                    </div>
+                    <p class="muted">
+                        "Separately configured from the chat gateway, so the two can be different providers on different keys. A model and a size are both a bill, so the server refuses anything outside the lists above."
+                    </p>
+                </Show>
+            </section>
+
+            <section class="pane">
                 <h3>"Windows"</h3>
                 <div class="kv">
                     <span>"open"</span>

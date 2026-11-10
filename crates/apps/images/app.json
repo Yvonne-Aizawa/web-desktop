@@ -1,0 +1,10 @@
+{
+  "id": "images",
+  "name": "Images",
+  "glyph": "🎨",
+  "accent": "#2dd4bf",
+  "blurb": "Draw something, with a model the server talks to",
+  "default_width": 840,
+  "default_height": 660,
+  "version": "0.1.0"
+}

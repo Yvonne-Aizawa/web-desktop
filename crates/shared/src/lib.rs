@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod ai;
 pub mod fs;
+pub mod image;
 
 /// Interface version between the shell and a served app.
 ///
@@ -262,6 +263,11 @@ pub struct Catalog {
     /// Empty `models` means it is off.
     #[serde(default)]
     pub ai: ai::AiInfo,
+    /// What the image gateway offers: which models and sizes it will accept. Empty
+    /// `models` means it is off. Configured separately from [`Self::ai`], so the two
+    /// can point at different providers.
+    #[serde(default)]
+    pub images: image::ImageInfo,
 }
 
 /// What the outbound proxy allows. Empty `hosts` means it is off.
@@ -298,6 +304,7 @@ pub fn default_catalog() -> Catalog {
         fs: fs::FsInfo::disabled(),
         proxy: ProxyInfo::default(),
         ai: ai::AiInfo::default(),
+        images: image::ImageInfo::default(),
     }
 }
 

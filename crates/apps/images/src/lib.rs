@@ -1,0 +1,726 @@
+//! Drawing something, with an image model the server talks to.
+//!
+//! The third served app to use a gateway, and the second to keep its results as files:
+//!
+//! * **The key and the address are the server's.** The app posts a prompt to
+//!   `/api/images/generate`; the server holds the provider's key, calls it, and returns
+//!   base64. Which models and which sizes the app may ask for is the server's list, not
+//!   its own — both are a bill, so both are an allow-list.
+//! * **A generated image is a file.** Each one is written under `images/` in the same
+//!   sandbox the Files app browses, named from the prompt with a timestamp so it sorts.
+//!   That is what makes the Gallery able to show it, Files able to rename or download
+//!   it, and the trash able to bring it back.
+//!
+//! Two details carry over from the Chat app and are worth not rediscovering:
+//!
+//! * **The prompt box is uncontrolled.** Binding `value` reactively rewrites the box on
+//!   every keystroke and browsers move the caret to the end when they do. `has_text`
+//!   tracks the button's look; the textarea's own value is the truth.
+//! * **The window's state is one `Copy` struct of signals, with no `Rc` anywhere.** The
+//!   same `Rc<dyn Fn(..)>` that is fine in an `on:click` is refused in a `{move || …}`
+//!   child, which must be `Send + Sync`; signals are `Copy` and `Send`, so a bundle of
+//!   them is both, and the actions are plain functions taking one.
+
+use app_sdk::fs::{self, EntryKind, image_mime};
+use app_sdk::image::{ImageInfo, ImageRequest};
+use app_sdk::prelude::*;
+use leptos::html::Textarea;
+use leptos::task::spawn_local;
+use wasm_bindgen::JsValue;
+
+/// Where generated images are kept, root-relative like every other path in the app.
+const DIR: &str = "images";
+
+/// How many saved images the sidebar reads and shows.
+const LIST_LIMIT: usize = 60;
+
+/// Characters of the prompt that become a filename.
+const STEM_CHARS: usize = 40;
+
+/// Counts the app offers. The server accepts up to `MAX_COUNT`; a bigger batch is a
+/// bigger bill, so the button does not invite one.
+const COUNTS: [u32; 4] = [1, 2, 3, 4];
+
+/// One generated image, and what became of it.
+#[derive(Debug, Clone, PartialEq)]
+struct Shot {
+    /// A `data:` URL, so the picture is on screen before — and whether or not — it
+    /// reaches disk. The only copy outside the sandbox.
+    data_url: String,
+    /// Whether a browser can draw [`Self::data_url`]; an unrecognised format is saved
+    /// and linked, but not shown as a broken tile.
+    previewable: bool,
+    /// Where it was saved, when the write succeeded.
+    saved: Option<String>,
+    /// Why it could not be saved: a read-only root, or a name the fence refused.
+    error: Option<String>,
+    /// Some models rewrite the prompt; the revised version is worth showing.
+    revised_prompt: Option<String>,
+}
+
+/// One row of the sidebar.
+#[derive(Debug, Clone, PartialEq)]
+struct Kept {
+    /// Root-relative path, which is also how it is opened, downloaded and removed.
+    path: String,
+    /// The file name, for a title and the download attribute.
+    name: String,
+}
+
+/// What the app is doing right now.
+#[derive(Debug, Clone, PartialEq)]
+enum Phase {
+    Idle,
+    /// A request is out. The window stays usable; Generate does not fire twice.
+    Waiting,
+    /// The last request failed, with the server's own words.
+    Failed(String),
+}
+
+/// The window's state in one copyable handle.
+#[derive(Clone, Copy)]
+struct State {
+    info: RwSignal<ImageInfo>,
+    model: RwSignal<String>,
+    size: RwSignal<String>,
+    count: RwSignal<u32>,
+    /// `""` means "whatever the model does by default".
+    quality: RwSignal<String>,
+    phase: RwSignal<Phase>,
+    /// The batch on screen.
+    shots: RwSignal<Vec<Shot>>,
+    /// What is already in `images/`, newest first.
+    kept: RwSignal<Vec<Kept>>,
+    /// A saved image being looked at, which replaces the batch on screen.
+    viewing: RwSignal<Option<Kept>>,
+    /// One line of "that did not work", from the server or from the file API.
+    notice: RwSignal<Option<String>>,
+    credits: RwSignal<Option<f64>>,
+    /// Only drives the Generate button's look. The textarea's own value is the truth.
+    has_text: RwSignal<bool>,
+}
+
+/// The prompt, reduced to something a filename can hold.
+///
+/// Anything that is not a letter or a digit becomes a dash, so the result can never
+/// contain a separator the file API would refuse; letters outside ASCII are kept,
+/// because a prompt in another alphabet deserves a filename in it.
+fn stem(prompt: &str) -> String {
+    let mut out = String::new();
+    let mut dash = true; // no leading dash
+    for ch in prompt.chars() {
+        if ch.is_alphanumeric() {
+            for lower in ch.to_lowercase() {
+                out.push(lower);
+            }
+            dash = false;
+        } else if !dash {
+            out.push('-');
+            dash = true;
+        }
+        if out.chars().count() >= STEM_CHARS {
+            break;
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "image".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+/// `2026-02-14-093012`, from milliseconds: the sort key at the front of every name, so a
+/// folder of generations is also a history.
+fn stamp(milliseconds: f64) -> String {
+    let date = js_sys::Date::new(&JsValue::from_f64(milliseconds));
+    format!(
+        "{:04}-{:02}-{:02}-{:02}{:02}{:02}",
+        date.get_full_year(),
+        date.get_month() + 1,
+        date.get_date(),
+        date.get_hours(),
+        date.get_minutes(),
+        date.get_seconds(),
+    )
+}
+
+/// Every picture in `images/`, newest first.
+///
+/// A name whose extension is not a format a browser decodes is skipped rather than shown
+/// as a broken tile, which is the same rule the Gallery follows.
+async fn load_kept() -> Result<Vec<Kept>, String> {
+    let listing = fs::list(DIR).await?;
+
+    let mut names: Vec<String> = listing
+        .entries
+        .into_iter()
+        .filter(|entry| entry.kind == EntryKind::File && image_mime(&entry.name).is_some())
+        .map(|entry| entry.name)
+        .collect();
+    // The name starts with a timestamp, so name order is time order.
+    names.sort();
+    names.reverse();
+    names.truncate(LIST_LIMIT);
+
+    Ok(names
+        .into_iter()
+        .map(|name| Kept {
+            path: format!("{DIR}/{name}"),
+            name,
+        })
+        .collect())
+}
+
+/// Put the folder's contents back into the sidebar, best-effort.
+async fn refresh(state: State) {
+    match load_kept().await {
+        Ok(found) => state.kept.set(found),
+        Err(err) => state.notice.set(Some(format!("cannot read {DIR}/: {err}"))),
+    }
+}
+
+/// Ask for a batch, show it, and write each image to the sandbox.
+///
+/// The write is best-effort and per image: the picture is already the user's, and a
+/// read-only root has to show up in the footer rather than swallow it. A batch that
+/// cannot be saved still shows every image, because they were still paid for.
+fn generate(state: State, ctx: Context, composer: NodeRef<Textarea>) {
+    if state.phase.get_untracked() == Phase::Waiting || !state.info.get_untracked().enabled() {
+        return;
+    }
+    let asked = composer
+        .get()
+        .map(|area| area.value())
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    if asked.is_empty() {
+        return;
+    }
+
+    if let Some(area) = composer.get() {
+        area.set_value("");
+        let _ = area.focus();
+    }
+    state.has_text.set(false);
+    state.phase.set(Phase::Waiting);
+    state.notice.set(None);
+    state.credits.set(None);
+    state.shots.set(Vec::new());
+    state.viewing.set(None);
+
+    let mut request = ImageRequest::new(asked.clone()).with_count(state.count.get_untracked());
+    for (slot, value) in [
+        (&mut request.model, state.model.get_untracked()),
+        (&mut request.size, state.size.get_untracked()),
+        (&mut request.quality, state.quality.get_untracked()),
+    ] {
+        if !value.is_empty() {
+            *slot = Some(value);
+        }
+    }
+
+    spawn_local(async move {
+        let answer = match app_sdk::image::generate(&request).await {
+            Ok(answer) => answer,
+            Err(err) => {
+                state.phase.set(Phase::Failed(err));
+                return;
+            }
+        };
+
+        let total = answer.images.len();
+        let stem = stem(&asked);
+        let stamp = stamp(js_sys::Date::now());
+        let mut shots = Vec::new();
+
+        for (index, image) in answer.images.into_iter().enumerate() {
+            // One image gets the plain name; several get a numbered suffix so they sit
+            // together in the folder.
+            let name = if total == 1 {
+                format!("{stamp}-{stem}.{}", image.extension())
+            } else {
+                format!("{stamp}-{stem}-{}.{}", index + 1, image.extension())
+            };
+            let path = format!("{DIR}/{name}");
+
+            let mut shot = Shot {
+                data_url: format!("data:{};base64,{}", image.mime, image.b64_json),
+                previewable: image.is_previewable(),
+                saved: None,
+                error: None,
+                revised_prompt: image.revised_prompt,
+            };
+
+            match app_sdk::image::decode_base64(&image.b64_json) {
+                Ok(bytes) => match fs::write_bytes(&path, &bytes, &image.mime).await {
+                    Ok(_) => {
+                        ctx.log(&format!("saved {path}"));
+                        shot.saved = Some(path);
+                    }
+                    Err(err) => shot.error = Some(err),
+                },
+                Err(err) => shot.error = Some(err),
+            }
+            shots.push(shot);
+        }
+
+        state.credits.set(answer.credits_cost);
+        state.shots.set(shots);
+        state.phase.set(Phase::Idle);
+        refresh(state).await;
+    });
+}
+
+/// Look at a saved image instead of the batch on screen.
+fn open_kept(state: State, kept: Kept) {
+    state.viewing.set(Some(kept));
+}
+
+/// Move a saved image to the trash, like any other file.
+fn remove_kept(state: State, path: String) {
+    spawn_local(async move {
+        match fs::trash(&path).await {
+            Ok(_) => {
+                if state.viewing.get_untracked().map(|kept| kept.path) == Some(path) {
+                    state.viewing.set(None);
+                }
+                refresh(state).await;
+            }
+            Err(err) => state
+                .notice
+                .set(Some(format!("could not remove it: {err}"))),
+        }
+    });
+}
+
+const STYLES: &str = "
+.images { display: flex; flex-direction: column; height: 100%; font-family: inherit;
+          font-size: 13px; box-sizing: border-box; }
+.img-head { display: flex; gap: 8px; align-items: center; padding: 9px 12px;
+            border-bottom: 1px solid; flex: none; flex-wrap: wrap; }
+.img-field { display: flex; align-items: center; gap: 6px; font-size: 11px; opacity: .8; }
+.img-select { padding: 6px 8px; border-radius: 8px; font-family: inherit; font-size: 12px;
+              background: rgba(255,255,255,.05); color: inherit;
+              border: 1px solid rgba(255,255,255,.12); max-width: 190px; }
+.img-btn { padding: 6px 11px; border-radius: 8px; font-family: inherit; font-size: 12px;
+           font-weight: 600; cursor: pointer; border: 1px solid rgba(255,255,255,.14);
+           background: rgba(255,255,255,.05); color: inherit; }
+.img-btn:disabled { opacity: .45; cursor: default; }
+.img-body { display: flex; flex: 1; min-height: 0; }
+.img-side { width: 176px; flex: none; overflow-y: auto; padding: 8px;
+            border-right: 1px solid; display: flex; flex-direction: column; gap: 4px; }
+.img-empty { font-size: 11.5px; opacity: .55; margin: 4px; line-height: 1.5; }
+.img-side-item { display: flex; align-items: stretch; border-radius: 8px; }
+.img-side-item:hover { background: rgba(255,255,255,.05); }
+.img-side-item.active { background: rgba(255,255,255,.09); }
+.img-side-open { flex: 1; min-width: 0; text-align: left; background: none; border: 0;
+                 color: inherit; font: inherit; cursor: pointer; padding: 5px;
+                 display: flex; flex-direction: column; gap: 4px; }
+.img-thumb { width: 100%; height: 72px; object-fit: cover; border-radius: 6px;
+             background: rgba(255,255,255,.04); display: block; }
+.img-side-name { font-size: 10.5px; opacity: .6; overflow: hidden;
+                 text-overflow: ellipsis; white-space: nowrap;
+                 font-family: ui-monospace, monospace; }
+.img-side-x { background: none; border: 0; color: inherit; cursor: pointer; opacity: .35;
+              font-size: 14px; line-height: 1; padding: 0 7px; }
+.img-side-x:hover { opacity: .9; }
+.img-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.img-log { flex: 1; overflow-y: auto; padding: 14px; }
+.img-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+            gap: 12px; }
+.img-card { display: flex; flex-direction: column; gap: 6px; border-radius: 10px;
+            border: 1px solid rgba(255,255,255,.09); overflow: hidden;
+            background: rgba(255,255,255,.03); }
+.img-card img { width: 100%; display: block; }
+.img-card-tile { padding: 22px 10px; text-align: center; font-size: 11.5px; opacity: .6; }
+.img-card-foot { padding: 6px 8px; display: flex; flex-direction: column; gap: 3px; }
+.img-card-note { font-size: 11px; opacity: .65; line-height: 1.4; }
+.img-card-warn { font-size: 11px; color: #ffc9a0; line-height: 1.4; }
+.img-link { font-size: 11px; color: inherit; opacity: .8; }
+.img-viewer { display: flex; flex-direction: column; gap: 10px; align-items: center; }
+.img-viewer img { max-width: 100%; max-height: 62vh; border-radius: 10px; display: block; }
+.img-viewer-bar { display: flex; gap: 10px; align-items: baseline; width: 100%; }
+.img-viewer-name { font-family: ui-monospace, monospace; font-size: 11.5px; opacity: .7;
+                   overflow-wrap: anywhere; }
+.img-error { color: #ff9ea1; font-size: 12px; line-height: 1.5; padding: 8px 10px;
+             border-radius: 10px; background: rgba(255,80,90,.08); }
+.img-welcome { opacity: .6; font-size: 12.5px; line-height: 1.6; max-width: 52ch; }
+.img-welcome code { font-family: ui-monospace, monospace; font-size: 11.5px; }
+.img-composer { display: flex; gap: 8px; align-items: flex-end; padding: 10px 12px;
+                border-top: 1px solid; flex: none; }
+.img-input { flex: 1; resize: none; min-height: 44px; max-height: 150px; padding: 9px 10px;
+             border-radius: 10px; border: 1px solid rgba(255,255,255,.12);
+             background: rgba(255,255,255,.05); color: inherit; font-family: inherit;
+             font-size: 12.5px; line-height: 1.45; }
+.img-input:focus { outline: 1px solid rgba(255,255,255,.22); }
+.img-foot { display: flex; gap: 10px; align-items: baseline; padding: 0 12px 9px; flex: none; }
+.img-note { font-size: 11px; line-height: 1.45; color: #ffc9a0; }
+.img-cost { font-size: 10.5px; opacity: .5; font-family: ui-monospace, monospace;
+            margin-left: auto; }
+";
+
+app_sdk::app! {
+    fn images(ctx: Context) -> impl IntoView {
+        let theme = ctx.theme();
+
+        // Options are remembered between windows and visits. Read before the first
+        // render so the signal's own effect cannot write a default over them.
+        let remembered = |key: &str| ctx.storage_get(key).unwrap_or_default();
+        let count = remembered("count")
+            .parse::<u32>()
+            .ok()
+            .filter(|n| COUNTS.contains(n))
+            .unwrap_or(1);
+
+        let state = State {
+            info: RwSignal::new(ImageInfo::default()),
+            model: RwSignal::new(remembered("model")),
+            size: RwSignal::new(remembered("size")),
+            count: RwSignal::new(count),
+            quality: RwSignal::new(remembered("quality")),
+            phase: RwSignal::new(Phase::Idle),
+            shots: RwSignal::new(Vec::new()),
+            kept: RwSignal::new(Vec::new()),
+            viewing: RwSignal::new(None),
+            notice: RwSignal::new(None),
+            credits: RwSignal::new(None),
+            has_text: RwSignal::new(false),
+        };
+
+        let composer = NodeRef::<Textarea>::new();
+
+        // Bootstrap: what this server offers, and what is already in the folder. The
+        // folder is created when it is missing, so a first run with a writable root just
+        // works — and a read-only one is reported rather than pretended about.
+        let boot_ctx = ctx.clone();
+        Effect::new(move |_| {
+            let boot_ctx = boot_ctx.clone();
+            spawn_local(async move {
+                if fs::list(DIR).await.is_err() {
+                    let _ = fs::create_dir("", DIR).await;
+                }
+                match app_sdk::image::info().await {
+                    Ok(found) => {
+                        // A remembered choice that this server does not offer is dropped
+                        // rather than shown as a selection that would be refused.
+                        if !found.models.iter().any(|model| model == &state.model.get_untracked()) {
+                            state.model.set(found.default_model.clone());
+                        }
+                        if !found.sizes.iter().any(|size| size == &state.size.get_untracked()) {
+                            state.size.set(found.sizes.first().cloned().unwrap_or_default());
+                        }
+                        if !matches!(state.quality.get_untracked().as_str(), "" | "standard" | "hd") {
+                            state.quality.set(String::new());
+                        }
+                        state.info.set(found);
+                    }
+                    Err(err) => state.notice.set(Some(err)),
+                }
+                refresh(state).await;
+                boot_ctx.log("ready");
+            });
+        });
+
+        // Remember the options, so reopening the app does not make the user pick the
+        // same size again.
+        let storage_ctx = ctx.clone();
+        Effect::new(move |_| {
+            storage_ctx.storage_set("model", &state.model.get());
+            storage_ctx.storage_set("size", &state.size.get());
+            storage_ctx.storage_set("count", &state.count.get().to_string());
+            storage_ctx.storage_set("quality", &state.quality.get());
+        });
+
+        let ready = move || state.info.get().enabled();
+        let text_colour = theme.text.clone();
+        let muted = theme.muted.clone();
+        let stroke = theme.stroke.clone();
+        let accent = theme.accent.clone();
+
+        // One `Context` per handler: each is moved into its closure, and a closure that
+        // moved the only one out would leave nothing for the next.
+        let key_ctx = ctx.clone();
+        let click_ctx = ctx.clone();
+
+        let generate_style = format!("border-color:{stroke};background:{accent};color:#0b0d12;");
+
+        view! {
+            <style>{STYLES}</style>
+            <div class="images" style=format!("color:{text_colour};")>
+                <div class="img-head" style=format!("border-color:{stroke};")>
+                    <label class="img-field">
+                        "model"
+                        <select
+                            class="img-select"
+                            prop:value=move || state.model.get()
+                            on:change=move |ev| state.model.set(event_target_value(&ev))
+                        >
+                            {move || {
+                                let info = state.info.get();
+                                if info.models.is_empty() {
+                                    return view! {
+                                        <option value="">"no image model configured"</option>
+                                    }.into_any();
+                                }
+                                info.models.into_iter().map(|name| {
+                                    let value = name.clone();
+                                    let chosen = name.clone();
+                                    view! {
+                                        <option value=value prop:selected=move || state.model.get() == chosen>
+                                            {name}
+                                        </option>
+                                    }
+                                }).collect_view().into_any()
+                            }}
+                        </select>
+                    </label>
+                    <label class="img-field">
+                        "size"
+                        <select
+                            class="img-select"
+                            prop:value=move || state.size.get()
+                            on:change=move |ev| state.size.set(event_target_value(&ev))
+                        >
+                            {move || state.info.get().sizes.into_iter().map(|size| {
+                                let value = size.clone();
+                                let chosen = size.clone();
+                                view! {
+                                    <option value=value prop:selected=move || state.size.get() == chosen>
+                                        {size}
+                                    </option>
+                                }
+                            }).collect_view()}
+                        </select>
+                    </label>
+                    <label class="img-field">
+                        "count"
+                        <select
+                            class="img-select"
+                            prop:value=move || state.count.get().to_string()
+                            on:change=move |ev| {
+                                if let Ok(n) = event_target_value(&ev).parse::<u32>() {
+                                    state.count.set(n);
+                                }
+                            }
+                        >
+                            {COUNTS.into_iter().map(|n| {
+                                view! {
+                                    <option value=n.to_string() prop:selected=move || state.count.get() == n>
+                                        {n.to_string()}
+                                    </option>
+                                }
+                            }).collect_view()}
+                        </select>
+                    </label>
+                    <label class="img-field">
+                        "quality"
+                        <select
+                            class="img-select"
+                            prop:value=move || state.quality.get()
+                            on:change=move |ev| state.quality.set(event_target_value(&ev))
+                        >
+                            <option value="" prop:selected=move || state.quality.get().is_empty()>
+                                "model default"
+                            </option>
+                            <option value="standard" prop:selected=move || state.quality.get() == "standard">
+                                "standard"
+                            </option>
+                            <option value="hd" prop:selected=move || state.quality.get() == "hd">
+                                "hd"
+                            </option>
+                        </select>
+                    </label>
+                </div>
+
+                <div class="img-body">
+                    <div class="img-side" style=format!("border-color:{stroke};")>
+                        {move || {
+                            let list = state.kept.get();
+                            if list.is_empty() {
+                                return view! {
+                                    <p class="img-empty">"Generated images are saved in " <code>"images/"</code> " and appear here."</p>
+                                }.into_any();
+                            }
+                            view! {
+                                <For each=move || state.kept.get() key=|kept| kept.path.clone() let:kept>
+                                    {
+                                        let is_open = kept.path.clone();
+                                        let to_open = kept.clone();
+                                        let to_remove = kept.path.clone();
+                                        let title = kept.name.clone();
+                                        view! {
+                                            <div
+                                                class="img-side-item"
+                                                class:active=move || state.viewing.get().map(|k| k.path) == Some(is_open.clone())
+                                            >
+                                                <button
+                                                    class="img-side-open"
+                                                    title=title
+                                                    on:click=move |_| open_kept(state, to_open.clone())
+                                                >
+                                                    <img class="img-thumb" loading="lazy" src=fs::raw_url(&kept.path) alt=""/>
+                                                    <span class="img-side-name">{kept.name}</span>
+                                                </button>
+                                                <button
+                                                    class="img-side-x"
+                                                    title="Move this image to the trash"
+                                                    on:click=move |_| remove_kept(state, to_remove.clone())
+                                                >
+                                                    "×"
+                                                </button>
+                                            </div>
+                                        }
+                                    }
+                                </For>
+                            }.into_any()
+                        }}
+                    </div>
+
+                    <div class="img-main">
+                        <div class="img-log">
+                            {move || {
+                                if let Some(kept) = state.viewing.get() {
+                                    let name = kept.name.clone();
+                                    let path = kept.path.clone();
+                                    return view! {
+                                        <div class="img-viewer">
+                                            <div class="img-viewer-bar">
+                                                <span class="img-viewer-name">{name.clone()}</span>
+                                                <a class="img-link" href=fs::download_url(&path) download=name.clone()>
+                                                    "⭳ Download"
+                                                </a>
+                                                <button
+                                                    class="img-btn"
+                                                    on:click=move |_| state.viewing.set(None)
+                                                >
+                                                    "Close"
+                                                </button>
+                                            </div>
+                                            <img src=fs::raw_url(&path) alt=""/>
+                                        </div>
+                                    }.into_any();
+                                }
+
+                                match state.phase.get() {
+                                    Phase::Waiting => view! {
+                                        <div class="img-welcome">"Drawing…"</div>
+                                    }.into_any(),
+                                    Phase::Failed(err) => view! {
+                                        <div class="img-error">{err}</div>
+                                    }.into_any(),
+                                    Phase::Idle => {
+                                        let shots = state.shots.get();
+                                        if shots.is_empty() {
+                                            return view! {
+                                                <p class="img-welcome">
+                                                    "Describe a picture. The server holds the provider's key, so nothing here can spend it on a host it was not pointed at."
+                                                    <br/>
+                                                    <br/>
+                                                    "Every result is saved to "
+                                                    <code>"images/"</code>
+                                                    " in your files, so the Gallery can show it and the trash can bring it back."
+                                                </p>
+                                            }.into_any();
+                                        }
+                                        view! {
+                                            <div class="img-grid">
+                                                {shots.into_iter().map(|shot| {
+                                                    // The saved file, as a link and the name it downloads as.
+                                                    let saved = shot.saved.as_deref().map(|path| {
+                                                        let name = path
+                                                            .rsplit('/')
+                                                            .next()
+                                                            .unwrap_or("image")
+                                                            .to_owned();
+                                                        (fs::download_url(path), name)
+                                                    });
+                                                    view! {
+                                                        <div class="img-card">
+                                                            {if shot.previewable {
+                                                                view! { <img src=shot.data_url.clone() alt=""/> }.into_any()
+                                                            } else {
+                                                                view! {
+                                                                    <div class="img-card-tile">"an image format this browser cannot draw"</div>
+                                                                }.into_any()
+                                                            }}
+                                                            <div class="img-card-foot">
+                                                                {saved.map(|(href, name)| {
+                                                                    let label = name.clone();
+                                                                    view! {
+                                                                        <a class="img-link" href=href download=name>
+                                                                            "⭳ " {label}
+                                                                        </a>
+                                                                    }
+                                                                })}
+                                                                {shot.error.as_ref().map(|err| view! {
+                                                                    <span class="img-card-warn">"not saved: " {err.clone()}</span>
+                                                                })}
+                                                                {shot.revised_prompt.as_ref().filter(|revised| !revised.is_empty()).map(|revised| view! {
+                                                                    <span class="img-card-note">{revised.clone()}</span>
+                                                                })}
+                                                            </div>
+                                                        </div>
+                                                    }
+                                                }).collect_view()}
+                                            </div>
+                                        }.into_any()
+                                    }
+                                }
+                            }}
+                        </div>
+
+                        <div class="img-composer" style=format!("border-color:{stroke};")>
+                            <textarea
+                                class="img-input"
+                                node_ref=composer
+                                rows="2"
+                                placeholder=move || if ready() {
+                                    "Describe a picture — Ctrl+Enter to draw"
+                                } else {
+                                    "the server has no image provider configured"
+                                }
+                                on:input=move |ev| state.has_text.set(!event_target_value(&ev).trim().is_empty())
+                                on:keydown=move |ev: web_sys::KeyboardEvent| {
+                                    if ev.key() == "Enter" && (ev.ctrl_key() || ev.meta_key()) {
+                                        ev.prevent_default();
+                                        generate(state, key_ctx.clone(), composer);
+                                    }
+                                }
+                            ></textarea>
+                            <button
+                                class="img-btn"
+                                style=generate_style.clone()
+                                disabled=move || {
+                                    state.phase.get() == Phase::Waiting
+                                        || !ready()
+                                        || !state.has_text.get()
+                                }
+                                on:click=move |_| generate(state, click_ctx.clone(), composer)
+                            >
+                                {move || if state.phase.get() == Phase::Waiting { "Drawing…" } else { "Generate" }}
+                            </button>
+                        </div>
+
+                        <div class="img-foot">
+                            {move || state.notice.get().map(|text| view! {
+                                <span class="img-note">{text}</span>
+                            })}
+                            <Show when=move || !ready()>
+                                <span class="img-note">
+                                    "Set WEB_DESKTOP_IMAGE_URL (and WEB_DESKTOP_IMAGE_KEY) on the server to enable this."
+                                </span>
+                            </Show>
+                            {move || state.credits.get().map(|credits| view! {
+                                <span class="img-cost" style=format!("color:{muted};")>
+                                    {format!("{credits:.2} credits")}
+                                </span>
+                            })}
+                        </div>
+                    </div>
+                </div>
+            </div>
+        }
+    }
+}

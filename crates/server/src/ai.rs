@@ -51,7 +51,7 @@ use shared::{
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::{AppState, fs::same_origin};
+use crate::{AppState, fs::same_origin, provider};
 
 /// Messages in one request. Well above a long conversation, low enough that a runaway
 /// client cannot make the server build an unbounded body.
@@ -60,8 +60,6 @@ pub const MAX_MESSAGES: usize = 200;
 pub const MAX_CHARS: usize = 400_000;
 /// Largest answer body read from the provider when it is not streaming.
 const MAX_ANSWER_BYTES: usize = 4 * 1024 * 1024;
-/// How much of a provider *error* body is read before it is quoted back.
-const MAX_ERROR_BYTES: usize = 8 * 1024;
 /// Whole-request budget when the answer is not streamed.
 pub const TIMEOUT_SECS: u64 = 180;
 /// Budget for establishing the connection.
@@ -389,7 +387,7 @@ fn stream_response(response: reqwest::Response, permit: OwnedSemaphorePermit) ->
 /// not arrive looking like the caller's own credentials were rejected.
 async fn provider_error(response: reqwest::Response) -> AiError {
     let status = response.status();
-    let detail = error_detail(response).await;
+    let detail = provider::error_body(response).await;
     let detail = if detail.is_empty() {
         String::new()
     } else {
@@ -407,45 +405,6 @@ async fn provider_error(response: reqwest::Response) -> AiError {
         )),
         _ => AiError::Upstream(format!("the provider answered {status}{detail}")),
     }
-}
-
-/// The provider's error message, in its own words, capped.
-///
-/// OpenAI puts it at `error.message`; other compatible servers put it at `message` or
-/// just send prose, so all three are tried before giving up on the body. Best-effort by
-/// design: an error that cannot be read still becomes an error, with whatever was
-/// readable quoted into it.
-async fn error_detail(response: reqwest::Response) -> String {
-    let mut body = Vec::new();
-    let mut chunks = response.bytes_stream();
-    while body.len() < MAX_ERROR_BYTES {
-        match chunks.next().await {
-            Some(Ok(chunk)) => {
-                let room = MAX_ERROR_BYTES - body.len();
-                body.extend_from_slice(&chunk[..chunk.len().min(room)]);
-            }
-            Some(Err(err)) => return format!("(the error body could not be read: {err})"),
-            None => break,
-        }
-    }
-    let bytes = &body[..];
-
-    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
-        for path in [["error", "message"], ["message", "message"]] {
-            if let Some(message) = value
-                .get(path[0])
-                .and_then(|error| error.get(path[1]))
-                .and_then(serde_json::Value::as_str)
-            {
-                return message.to_owned();
-            }
-        }
-        if let Some(message) = value.get("error").and_then(serde_json::Value::as_str) {
-            return message.to_owned();
-        }
-    }
-
-    String::from_utf8_lossy(bytes).trim().to_owned()
 }
 
 /// What a request has to look like before anything is sent.
@@ -692,6 +651,7 @@ mod tests {
             proxy: None,
             fs: None,
             ai: Some(ai),
+            images: None,
         })
     }
 
@@ -789,6 +749,7 @@ mod tests {
             proxy: None,
             fs: None,
             ai: None,
+            images: None,
         });
 
         let err = chat(State(state.clone()), Json(request(None, false)))

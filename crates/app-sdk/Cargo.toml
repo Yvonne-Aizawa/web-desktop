@@ -26,6 +26,9 @@ ai-stream = [
 # Opt in to `app_sdk::fs`: reading and writing files through the shell's file API,
 # inside the same fence the Files app lives in.
 fs = ["dep:gloo-net", "dep:serde", "dep:serde_json", "dep:shared"]
+# Opt in to `app_sdk::image`: generating an image with a model the server talks to,
+# through the same shape as `ai` — the app never holds a provider's key.
+image = ["dep:gloo-net", "dep:serde", "dep:serde_json", "dep:shared"]
 
 [dependencies]
 # Only for `fetch`.

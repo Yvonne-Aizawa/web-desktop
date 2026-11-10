@@ -26,7 +26,23 @@ use shared::fs::{
 // The wire types live in `shared` so both ends agree by construction; re-exported here
 // so an app can name them — a listing's entries, an entry's kind — without having to
 // depend on `shared` itself.
-pub use shared::fs::{DirListing, EntryKind, FilePreview, FsEntry, PreviewBody, TrashEntry};
+pub use shared::fs::{
+    DirListing, EntryKind, FilePreview, FsEntry, PreviewBody, TrashEntry, image_mime,
+};
+
+/// The URL an `<img src>` can point at for a file, if it is a picture the browser can
+/// decode.
+///
+/// The path is escaped the same way every read on the file API takes it, so a name with
+/// a space or a `#` in it still works.
+pub fn raw_url(path: &str) -> String {
+    path_url(shared::fs::API_FS_RAW, path)
+}
+
+/// The URL a download link points at: the raw bytes, as an attachment.
+pub fn download_url(path: &str) -> String {
+    path_url(shared::fs::API_FS_DOWNLOAD, path)
+}
 
 /// One directory's entries, newest state on disk.
 pub async fn list(path: &str) -> Result<DirListing, String> {
@@ -54,6 +70,21 @@ pub async fn write_text(path: &str, text: &str) -> Result<FsEntry, String> {
     let request = Request::put(&path_url(API_FS_CONTENT, path))
         .header("content-type", "text/plain; charset=utf-8")
         .body(text)
+        .map_err(|err| format!("could not build the request: {err}"))?;
+    send(request).await
+}
+
+/// Write raw `bytes` as a file's whole contents, creating it if it does not exist.
+///
+/// This is the same endpoint as [`write_text`] with a different `content-type`, which is
+/// all the server needs to tell an upload from a save. `content_type` is the app's claim
+/// about the bytes — a generated image knows its own type — and the server stores the
+/// bytes regardless, so a wrong guess costs a `Content-Type` on a download and nothing
+/// more.
+pub async fn write_bytes(path: &str, bytes: &[u8], content_type: &str) -> Result<FsEntry, String> {
+    let request = Request::put(&path_url(API_FS_CONTENT, path))
+        .header("content-type", content_type)
+        .body(js_sys::Uint8Array::from(bytes))
         .map_err(|err| format!("could not build the request: {err}"))?;
     send(request).await
 }
